@@ -1,6 +1,6 @@
 /*
  $License:
-    Copyright (C) 2010 InvenSense Corporation, All Rights Reserved.
+    Copyright (C) 2011 InvenSense Corporation, All Rights Reserved.
 
     This program is free software; you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -27,19 +27,15 @@
 #include "mpu.h"
 #include "mpuirq.h"
 
-#define SLAVEIRQ_ENABLE_DEBUG          (1)
-#define SLAVEIRQ_GET_INTERRUPT_CNT     (2)
-#define SLAVEIRQ_GET_IRQ_TIME          (3)
-#define SLAVEIRQ_GET_LED_VALUE         (4)
-#define SLAVEIRQ_SET_TIMEOUT           (5)
-#define SLAVEIRQ_SET_SLAVE_INFO        (6)
+#define SLAVEIRQ_SET_TIMEOUT           _IOW(MPU_IOCTL, 0x50, unsigned long)
+#define SLAVEIRQ_GET_INTERRUPT_CNT     _IOR(MPU_IOCTL, 0x51, unsigned long)
+#define SLAVEIRQ_GET_IRQ_TIME          _IOR(MPU_IOCTL, 0x52, unsigned long)
 
 #ifdef __KERNEL__
 
 void slaveirq_exit(struct ext_slave_platform_data *pdata);
 int slaveirq_init(struct i2c_adapter *slave_adapter,
-		struct ext_slave_platform_data *pdata,
-		char *name);
+		  struct ext_slave_platform_data *pdata, char *name);
 
 #endif
 

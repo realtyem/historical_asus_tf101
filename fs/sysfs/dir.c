@@ -231,7 +231,7 @@ void release_sysfs_dirent(struct sysfs_dirent * sd)
 		goto repeat;
 }
 
-static int sysfs_dentry_delete(struct dentry *dentry)
+static int sysfs_dentry_delete(const struct dentry *dentry)
 {
 	struct sysfs_dirent *sd = dentry->d_fsdata;
 	return !!(sd->s_flags & SYSFS_FLAG_REMOVED);
@@ -239,9 +239,13 @@ static int sysfs_dentry_delete(struct dentry *dentry)
 
 static int sysfs_dentry_revalidate(struct dentry *dentry, struct nameidata *nd)
 {
-	struct sysfs_dirent *sd = dentry->d_fsdata;
+	struct sysfs_dirent *sd;
 	int is_dir;
 
+	if (nd->flags & LOOKUP_RCU)
+		return -ECHILD;
+
+	sd = dentry->d_fsdata;
 	mutex_lock(&sysfs_mutex);
 
 	/* The sysfs dirent has been deleted */
@@ -701,7 +705,7 @@ static struct dentry * sysfs_lookup(struct inode *dir, struct dentry *dentry,
 	/* instantiate and hash dentry */
 	ret = d_find_alias(inode);
 	if (!ret) {
-		dentry->d_op = &sysfs_dentry_ops;
+		d_set_d_op(dentry, &sysfs_dentry_ops);
 		dentry->d_fsdata = sysfs_get(sd);
 		d_add(dentry, inode);
 	} else {
@@ -745,7 +749,7 @@ static void __sysfs_remove_dir(struct sysfs_dirent *dir_sd)
 	if (!dir_sd)
 		return;
 
-	printk("sysfs %s: removing dir\n", dir_sd->s_name);
+	pr_debug("sysfs %s: removing dir\n", dir_sd->s_name);
 	sysfs_addrm_start(&acxt, dir_sd);
 	pos = &dir_sd->s_dir.children;
 	while (*pos) {

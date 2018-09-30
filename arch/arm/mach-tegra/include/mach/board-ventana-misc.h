@@ -2,7 +2,7 @@
  * arch/arm/mach-tegra/include/board-ventana-misc.h
  *
  * Copyright (C) 2010-2011 ASUSTek Computer Incorporation
- * Author: Paris Yeh <paris_yeh@asus.com>
+ * Author: Paris Yeh <paris_yeh@asus.com>, Victor Chen <victor_chen@asus.com>
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -17,21 +17,25 @@
 
 //The ventana_hw is hexadecimal representation as follows.
 //
-//    HW[7:0] =  7  6  5  4  3  2  1  0
-//              +-----------+-----------+
-//              |PCB_ID[3:0]|GMI_AD[7:4]|
-//              +-----------+-----------+
-//    where PCB_ID[3:0] is KB_ROW[3:0]
+//    HW[9:0] =  9  8  7  6  5  4  3  2  1  0
+//              +----------------+-----------+
+//              |   PCB_ID[5:0]  |GMI_AD[7:4]|
+//              +----------------+-----------+
+//    where PCB_ID[5:0] is KB_ROW[5:0]
 //
-//    PCB_ID[3:0] =  3    2    1    0
-//                  +-----------------+
-//                  |PRJ[0]| SKU[2:0] |
-//                  +-----------------+
-//    PRJ[0]                    SKU[2:0]
+//    PCB_ID[5:0] =   5    4    3    2    1    0
+//                  +----------+-----------------+
+//                  |WIMAX[1:0]|PRJ[0]| SKU[2:0] |
+//                  +----------+-----------------+
+//    PRJ[0]                    SKU[3:0]
 //    0b -> TF101(SINTEK)       000b -> W/O 3G, Murata BT/WLAN
 //    0b -> TF101(SINTEK)       001b -> 3G, Murata BT/WLAN
 //    0b -> TF101(SINTEK)       010b -> W/O 3G, AZW BT/WLAN
 //    0b -> TF101(SINTEK)       011b -> 3G, AZW BT/WLAN
+//
+//    WIMAX[1:0]	PRJ[0]                    SKU[3:0]
+//    01b		0b -> TF101(SINTEK)       000b -> WiMAX, Murata BT/WLAN
+//
 //    0b -> TF101(WINTEK)       100b -> W/O 3G, Murata BT/WLAN
 //    0b -> TF101(WINTEK)       101b -> 3G, Murata BT/WLAN
 //    0b -> TF101(WINTEK)       110b -> W/O 3G, AZW BT/WLAN
@@ -118,6 +122,11 @@ extern "C"
 #define TEGRA_DEVKIT_MISC_HW_0_PROJECT_DEFAULT  0x0UL //TF101(EP101)
 #define TEGRA_DEVKIT_MISC_HW_0_PROJECT_1        0x1UL //SL101(EP102)
 
+//WiMAX Identification
+#define TEGRA_DEVKIT_MISC_HW_0_WIMAX_RANGE      8:8
+#define TEGRA_DEVKIT_MISC_HW_0_WIMAX_DEFAULT    0x0UL //W/O WiMAX
+#define TEGRA_DEVKIT_MISC_HW_0_WIMAX_1          0x1UL //WiMAX
+
 
 //The byte-field definition of Tegra2 ReservedOdm fuse is defined as follows
 //31    26       20                        0
@@ -133,6 +142,8 @@ extern "C"
 
 //WiFi Mac address
 #define TEGRA_DEVKIT_MISC_HW_0_WIFI_RANGE 25:20
+
+#define VENTANA_PCBID_OUTPUT_LENGTH 7
 
 extern unsigned char ventana_chipid[17];
 
@@ -150,6 +161,12 @@ unsigned int ASUSGetProjectID(void);
  *      If 3G is equipped, 1 will be returned; Otherwise, 0 will be instead.
  */
 unsigned int ASUS3GAvailable(void);
+
+/* Detect if WiMAX is equipped
+ *   @ret unsigned int
+ *      If WiMAX is equipped, 1 will be returned; Otherwise, 0 will be instead.
+ */
+unsigned int ASUSWiMAXAvailable(void);
 
 
 #define BT_WLAN_VENDOR_AZW          TEGRA_DEVKIT_MISC_HW_0_VENDOR_DEFAULT
@@ -173,6 +190,26 @@ unsigned int ASUSCheckWLANVendor(unsigned int vendor);
  *      Otherwise, 0 will be instead.
  */
 unsigned int ASUSCheckTouchVendor(unsigned int vendor);
+
+/* Acquire project name
+ *      No return parameter
+ *      Project name will be assigned according to different kinds devices. (TF101, TF101G, TF101-WIMAX, and SL101)
+ */
+static void ASUSGetProjectName(void);
+
+/* Acquire pcb id
+ *      No return parameter
+ *      This function will perform the assignment for ventana_pcbid in string format
+ *      Format of ventana_pcbid:
+ *      =>TF101:x00xx0b
+ *      =>TF101G:x00xx1b
+ *      =>TF101-WiMax:x10xx0b
+ *      =>SL101:x01xx0b
+ */
+static void ASUSGetPcbid(void);
+
+/* ASUS uses the following to store the lcd pixel clock freq. Then decide the vaule by project name.*/
+extern u32 lcd_pclk_khz;
 
 #if defined(__cplusplus)
 }

@@ -70,14 +70,14 @@ extern "C" {
 #else
 	/* Based off the log priorities in android
 	   /system/core/include/android/log.h */
-#define MPL_LOG_UNKNOWN (0)
-#define MPL_LOG_DEFAULT (1)
-#define MPL_LOG_VERBOSE (2)
-#define MPL_LOG_DEBUG (3)
-#define MPL_LOG_INFO (4)
-#define MPL_LOG_WARN (5)
-#define MPL_LOG_ERROR (6)
-#define MPL_LOG_SILENT (8)
+#define MPL_LOG_UNKNOWN		(0)
+#define MPL_LOG_DEFAULT		(1)
+#define MPL_LOG_VERBOSE		(2)
+#define MPL_LOG_DEBUG		(3)
+#define MPL_LOG_INFO		(4)
+#define MPL_LOG_WARN		(5)
+#define MPL_LOG_ERROR		(6)
+#define MPL_LOG_SILENT		(8)
 #endif
 
 
@@ -140,7 +140,11 @@ extern "C" {
  * Simplified macro to send an info log message using the current MPL_LOG_TAG.
  */
 #ifndef MPL_LOGI
+#if MPL_LOG_NDEBUG
+#define MPL_LOGI(cond, ...)   ((void)0)
+#else
 #define MPL_LOGI(...) ((void)MPL_LOG(LOG_INFO, MPL_LOG_TAG, __VA_ARGS__))
+#endif
 #endif
 
 #ifndef MPL_LOGI_IF

@@ -27,7 +27,6 @@
 
 #include "sdio_ops.h"
 
-#define PATCH
 static int process_sdio_pending_irqs(struct mmc_card *card)
 {
 	int i, ret, count;
@@ -46,7 +45,7 @@ static int process_sdio_pending_irqs(struct mmc_card *card)
 			struct sdio_func *func = card->sdio_func[i - 1];
 			if (!func) {
 				printk(KERN_WARNING "%s: pending IRQ for "
-					"non-existant function\n",
+					"non-existent function\n",
 					mmc_card_id(card));
 				ret = -EINVAL;
 			} else if (func->irq_handler) {
@@ -145,15 +144,6 @@ static int sdio_irq_thread(void *_host)
 	if (host->caps & MMC_CAP_SDIO_IRQ)
 		host->ops->enable_sdio_irq(host, 0);
 
-#ifdef PATCH
-	while (!kthread_should_stop()) {
-		printk("[%s]: [%d], wait for someone to reclaim\n", __func__, current->pid);
-		set_current_state(TASK_INTERRUPTIBLE);
-		schedule_timeout(HZ);
-		set_current_state(TASK_RUNNING);
-	}
-#endif
-
 	pr_debug("%s: IRQ thread exiting with code %d\n",
 		 mmc_hostname(host), ret);
 
@@ -190,17 +180,7 @@ static int sdio_card_irq_put(struct mmc_card *card)
 
 	if (!--host->sdio_irqs) {
 		atomic_set(&host->sdio_irq_thread_abort, 1);
-#ifndef PATCH
 		kthread_stop(host->sdio_irq_thread);
-#else
-		if (host->claimed) {
-			mmc_release_host(host);
-			kthread_stop(host->sdio_irq_thread);
-			mmc_claim_host(host);
-		} else {
-			kthread_stop(host->sdio_irq_thread);
-		}
-#endif
 	}
 
 	return 0;

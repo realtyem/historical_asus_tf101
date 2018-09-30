@@ -32,6 +32,7 @@
 #include <linux/init.h>
 #include <linux/jiffies.h>
 #include <linux/slab.h>
+#include <asm/unaligned.h>
 #include <asm/uaccess.h>
 #include <asm/string.h>
 
@@ -82,23 +83,7 @@ struct asyncppp {
 #define SC_TOSS		1
 #define SC_ESCAPE	2
 #define SC_PREV_ERROR	4
-#ifdef CONFIG_DEBUG_ASUS
-#define virtual_detect_attr(_name) \
-static struct kobj_attribute _name##_attr = {   \
-    .attr   = {             \
-    .name = __stringify(_name), \
-        .mode = 0660,           \
-    },                  \
-    .show   = _name##_show,         \
-    .store  = _name##_store,        \
-}
 
-#define LOG_DETECT                     "log_detect"
-#define STR_TURN_ON                    "on"
-#define STR_TURN_OFF                   "off"
-static int logActivate;
-static struct kobject *log_kobj;
-#endif /*def CONFIG_DEBUG_ASUS*/
 /* Bits in rbits */
 #define SC_RCV_BITS	(SC_RCV_B7_1|SC_RCV_B7_0|SC_RCV_ODDP|SC_RCV_EVNP)
 
@@ -200,7 +185,7 @@ ppp_asynctty_open(struct tty_struct *tty)
 	tasklet_init(&ap->tsk, ppp_async_process, (unsigned long) ap);
 
 	atomic_set(&ap->refcnt, 1);
-	init_MUTEX_LOCKED(&ap->dead_sem);
+	sema_init(&ap->dead_sem, 0);
 
 	ap->chan.private = ap;
 	ap->chan.ops = &async_ops;
@@ -401,81 +386,17 @@ static struct tty_ldisc_ops ppp_ldisc = {
 	.receive_buf = ppp_asynctty_receive,
 	.write_wakeup = ppp_asynctty_wakeup,
 };
-#ifdef CONFIG_DEBUG_ASUS
-static ssize_t log_enabled_show( struct kobject *kobj, struct kobj_attribute *attr, char *buf ) {
-
-       char *s = buf;
-       if( logActivate>0 ) {
-               s += sprintf( s, STR_TURN_ON"\n" );
-       }
-       else {
-               s += sprintf( s, STR_TURN_OFF"\n" );
-       }
-       return (s - buf);
-}
-static ssize_t log_enabled_store( struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count ) {
-
-       if( (count >= strlen( STR_TURN_ON )) && (strncmp( buf, STR_TURN_ON, strlen( STR_TURN_ON ) ) == 0) ) {
-               logActivate = 1;
-               return count;
-       }
-
-       if( (count >= strlen( STR_TURN_OFF )) && (strncmp( buf, STR_TURN_OFF, strlen( STR_TURN_OFF ) ) == 0) ) {
-               logActivate = 0;
-               return count;
-       }
-
-       printk( KERN_INFO "wifi_enabled_store: Invalid argument\n" );
-       return -EINVAL;
-}
-
-virtual_detect_attr( log_enabled );
-static struct attribute *attr_list[] = {
-
-       &log_enabled_attr.attr,
-       NULL,
-};
-static struct attribute_group attr_group = {
-
-       .attrs = attr_list,
-};
-#endif /*def CONFIG_DEBUG_ASUS*/
 
 static int __init
 ppp_async_init(void)
 {
 	int err;
-#ifdef CONFIG_DEBUG_ASUS
-	int ret;
-       logActivate = 0;
-       log_kobj = kobject_create_and_add( LOG_DETECT, NULL );
-       if( !log_kobj ) {
 
-               printk( KERN_ERR "virtual_detect_init: cannot create kobject\n" );
-               return -ENOMEM;
-       }
-
-       // Register kobj_attribute
-       ret = sysfs_create_group( log_kobj, &attr_group );
-       if( ret ) {
-
-               printk( KERN_ERR "virtual_detect_init: cannot create group\n" );
-               ret = -ENOMEM;
-               goto ErrExit;
-       }
-
-       printk( KERN_INFO "PPP Log initialized\n" );
-#endif /*def CONFIG_DEBUG_ASUS*/
 	err = tty_register_ldisc(N_PPP, &ppp_ldisc);
 	if (err != 0)
 		printk(KERN_ERR "PPP_async: error %d registering line disc.\n",
 		       err);
 	return err;
-#ifdef CONFIG_DEBUG_ASUS
-ErrExit:
-       kobject_del( log_kobj );
-       return 0;
-#endif /*def CONFIG_DEBUG_ASUS*/
 }
 
 /*
@@ -622,7 +543,7 @@ ppp_async_encode(struct asyncppp *ap)
 	data = ap->tpkt->data;
 	count = ap->tpkt->len;
 	fcs = ap->tfcs;
-	proto = (data[0] << 8) + data[1];
+	proto = get_unaligned_be16(data);
 
 	/*
 	 * LCP packets with code values between 1 (configure-reqest)
@@ -759,12 +680,6 @@ ppp_async_push(struct asyncppp *ap)
 			continue;
 		}
 		if (ap->optr >= ap->olim && ap->tpkt) {
-#ifdef CONFIG_DEBUG_ASUS
-			if(logActivate>0)
-			{
-				printk("=> %d\n",ap->tpkt->len+14);
-			}
-#endif /*def CONFIG_DEBUG_ASUS*/
 			if (ppp_async_encode(ap)) {
 				/* finished processing ap->tpkt */
 				clear_bit(XMIT_FULL, &ap->xmit_flags);
@@ -868,13 +783,6 @@ process_input_packet(struct asyncppp *ap)
 	len = skb->len;
 	if (len < 3)
 		goto err;	/* too short */
-
-#ifdef CONFIG_DEBUG_ASUS
-	if(logActivate>0)
-	{
-		printk("<= %d\n",len+13);
-	}
-#endif /*def CONFIG_DEBUG_ASUS*/
 	fcs = PPP_INITFCS;
 	for (; len > 0; --len)
 		fcs = PPP_FCS(fcs, *p++);
@@ -1056,7 +964,7 @@ static void async_lcp_peek(struct asyncppp *ap, unsigned char *data,
 	code = data[0];
 	if (code != CONFACK && code != CONFREQ)
 		return;
-	dlen = (data[2] << 8) + data[3];
+	dlen = get_unaligned_be16(data + 2);
 	if (len < dlen)
 		return;		/* packet got truncated or length is bogus */
 
@@ -1090,15 +998,14 @@ static void async_lcp_peek(struct asyncppp *ap, unsigned char *data,
 	while (dlen >= 2 && dlen >= data[1] && data[1] >= 2) {
 		switch (data[0]) {
 		case LCP_MRU:
-			val = (data[2] << 8) + data[3];
+			val = get_unaligned_be16(data + 2);
 			if (inbound)
 				ap->mru = val;
 			else
 				ap->chan.mtu = val;
 			break;
 		case LCP_ASYNCMAP:
-			val = (data[2] << 24) + (data[3] << 16)
-				+ (data[4] << 8) + data[5];
+			val = get_unaligned_be32(data + 2);
 			if (inbound)
 				ap->raccm = val;
 			else
@@ -1112,9 +1019,6 @@ static void async_lcp_peek(struct asyncppp *ap, unsigned char *data,
 
 static void __exit ppp_async_cleanup(void)
 {
-#ifdef CONFIG_DEBUG_ASUS
-       kobject_del( log_kobj );
-#endif /*def CONFIG_DEBUG_ASUS*/
 	if (tty_unregister_ldisc(N_PPP) != 0)
 		printk(KERN_ERR "failed to unregister PPP line discipline\n");
 }

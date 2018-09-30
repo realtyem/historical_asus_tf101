@@ -1,6 +1,6 @@
 /*
  $License:
-    Copyright (C) 2010 InvenSense Corporation, All Rights Reserved.
+    Copyright (C) 2011 InvenSense Corporation, All Rights Reserved.
 
     This program is free software; you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -22,20 +22,21 @@
 
 #ifdef __KERNEL__
 #include <linux/i2c-dev.h>
+#include <linux/time.h>
+#else
+#include <sys/time.h>
 #endif
+#include "mldl_cfg.h"
 
-#define MPUIRQ_ENABLE_DEBUG          (1)
-#define MPUIRQ_GET_INTERRUPT_CNT     (2)
-#define MPUIRQ_GET_IRQ_TIME          (3)
-#define MPUIRQ_GET_LED_VALUE         (4)
-#define MPUIRQ_SET_TIMEOUT           (5)
-#define MPUIRQ_SET_ACCEL_INFO        (6)
-#define MPUIRQ_SET_FREQUENCY_DIVIDER (7)
+#define MPUIRQ_SET_TIMEOUT           _IOW(MPU_IOCTL, 0x40, unsigned long)
+#define MPUIRQ_GET_INTERRUPT_CNT     _IOR(MPU_IOCTL, 0x41, unsigned long)
+#define MPUIRQ_GET_IRQ_TIME          _IOR(MPU_IOCTL, 0x42, struct timeval)
+#define MPUIRQ_SET_FREQUENCY_DIVIDER _IOW(MPU_IOCTL, 0x43, unsigned long)
 
 #ifdef __KERNEL__
 
 void mpuirq_exit(void);
-int mpuirq_init(struct i2c_client *mpu_client);
+int mpuirq_init(struct i2c_client *mpu_client, struct mldl_cfg *mldl_cfg);
 
 #endif
 

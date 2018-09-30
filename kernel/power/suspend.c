@@ -22,7 +22,9 @@
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
-#include <linux/smp.h>
+#include <linux/syscore_ops.h>
+#include <trace/events/power.h>
+
 #include "power.h"
 
 #include <mach/iomap.h>
@@ -70,7 +72,7 @@ int suspend_enter_flag=0;
 extern struct timer_list suspend_timer;
 extern  void suspend_worker_timeout(unsigned long data);
 
-extern const char *const pm_states[PM_SUSPEND_MAX] = {
+const char *const pm_states[PM_SUSPEND_MAX] = {
 #ifdef CONFIG_EARLYSUSPEND
 	[PM_SUSPEND_ON]		= "on",
 #endif
@@ -78,13 +80,13 @@ extern const char *const pm_states[PM_SUSPEND_MAX] = {
 	[PM_SUSPEND_MEM]	= "mem",
 };
 
-static struct platform_suspend_ops *suspend_ops;
+static const struct platform_suspend_ops *suspend_ops;
 
 /**
  *	suspend_set_ops - Set the global suspend method table.
  *	@ops:	Pointer to ops structure.
  */
-void suspend_set_ops(struct platform_suspend_ops *ops)
+void suspend_set_ops(const struct platform_suspend_ops *ops)
 {
 	mutex_lock(&pm_mutex);
 	suspend_ops = ops;
@@ -155,6 +157,7 @@ static int suspend_prepare(void)
 	suspend_timer.function = suspend_worker_timeout;
 	add_timer(&suspend_timer);
 	watchdog_enable(44);
+
 	error = suspend_freeze_processes();
 	watchdog_disable();
 	del_timer_sync(&suspend_timer);
@@ -164,6 +167,7 @@ static int suspend_prepare(void)
 	suspend_timer.function = suspend_worker_timeout;
 	add_timer(&suspend_timer);
 	watchdog_enable(11);
+
 	if (!error)
 		return 0;
 
@@ -193,7 +197,6 @@ void __attribute__ ((weak)) arch_suspend_enable_irqs(void)
  *
  *	This function should be called after devices have been suspended.
  */
-
 static int suspend_enter(suspend_state_t state)
 {
 	int error;
@@ -233,12 +236,19 @@ static int suspend_enter(suspend_state_t state)
 
 	arch_suspend_disable_irqs();
 	BUG_ON(!irqs_disabled());
+
 	error = sysdev_suspend(PMSG_SUSPEND);
 	if (!error) {
-		if (!suspend_test(TEST_CORE) && pm_check_wakeup_events()) {
+		error = syscore_suspend();
+		if (error)
+			sysdev_resume();
+	}
+	if (!error) {
+		if (!(suspend_test(TEST_CORE) || pm_wakeup_pending())) {
 			error = suspend_ops->enter(state);
 			events_check_enabled = false;
 		}
+		syscore_resume();
 		sysdev_resume();
 	}
 
@@ -246,13 +256,8 @@ static int suspend_enter(suspend_state_t state)
 	BUG_ON(irqs_disabled());
 
  Enable_cpus:
-	init_timer_on_stack(&timer);
-	timer.expires = jiffies + HZ * 4;
-	timer.function = disable_nonboot_cpus_timeout;
-	add_timer(&timer);
 	enable_nonboot_cpus();
-      del_timer_sync(&timer);
-      destroy_timer_on_stack(&timer);
+
  Platform_wake:
 	if (suspend_ops->wake)
 		suspend_ops->wake();
@@ -278,13 +283,13 @@ int suspend_devices_and_enter(suspend_state_t state)
 	if (!suspend_ops)
 		return -ENOSYS;
 
+	trace_machine_suspend(state);
 	if (suspend_ops->begin) {
 		error = suspend_ops->begin(state);
 		if (error)
 			goto Close;
 	}
 	suspend_console();
-	pm_restrict_gfp_mask();
 	suspend_test_start();
 	error = dpm_suspend_start(PMSG_SUSPEND);
 	if (error) {
@@ -294,17 +299,20 @@ int suspend_devices_and_enter(suspend_state_t state)
 	suspend_test_finish("suspend devices");
 	if (suspend_test(TEST_DEVICES))
 		goto Recover_platform;
+
 	suspend_enter(state);
 
  Resume_devices:
 	suspend_test_start();
 	dpm_resume_end(PMSG_RESUME);
 	suspend_test_finish("resume devices");
-	pm_restore_gfp_mask();
+        printk("PM: resume_console+\n");
 	resume_console();
+	printk("PM: resume_console-\n");
  Close:
 	if (suspend_ops->end)
 		suspend_ops->end();
+	trace_machine_suspend(PWR_EVENT_EXIT);
 	return error;
 
  Recover_platform:
@@ -321,10 +329,12 @@ int suspend_devices_and_enter(suspend_state_t state)
  */
 static void suspend_finish(void)
 {
+	printk("suspend_finish+\n");
 	suspend_thaw_processes();
 	usermodehelper_enable();
 	pm_notifier_call_chain2(PM_POST_SUSPEND);
 	pm_restore_console();
+	printk("suspend_finish-\n");
 }
 
 /**
@@ -347,9 +357,9 @@ int enter_state(suspend_state_t state)
 	if (!mutex_trylock(&pm_mutex))
 		return -EBUSY;
 
-	printk(KERN_INFO "PM: Syncing filesystems ...cpu=%u ",smp_processor_id());
+	printk(KERN_INFO "PM: Syncing filesystems ... ");
 	sys_sync();
-	printk("done. cpu=%u\n",smp_processor_id());
+	printk("done.\n");
 
 	pr_debug("PM: Preparing system for %s sleep\n", pm_states[state]);
 	error = suspend_prepare();
@@ -360,7 +370,9 @@ int enter_state(suspend_state_t state)
 		goto Finish;
 
 	pr_debug("PM: Entering %s sleep\n", pm_states[state]);
+	pm_restrict_gfp_mask();
 	error = suspend_devices_and_enter(state);
+	pm_restore_gfp_mask();
 
  Finish:
 	pr_debug("PM: Finishing wakeup.\n");

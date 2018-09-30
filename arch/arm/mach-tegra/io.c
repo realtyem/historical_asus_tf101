@@ -7,6 +7,8 @@
  *	Colin Cross <ccross@google.com>
  *	Erik Gilling <konkers@google.com>
  *
+ * Copyright (C) 2010-2011 NVIDIA Corporation
+ *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
  * may be copied, distributed, and modified under those terms.
@@ -25,6 +27,7 @@
 #include <linux/io.h>
 
 #include <mach/hardware.h>
+#include <mach/iomap.h>
 #include <asm/page.h>
 #include <asm/mach/map.h>
 
@@ -91,8 +94,15 @@ void __iomem *tegra_ioremap(unsigned long p, size_t size, unsigned int type)
 	 * __arm_ioremap fails to set the domain of ioremapped memory
 	 * correctly, only use it on physical memory.
 	 */
-	if (v == NULL && p < SZ_1G)
-		v = __arm_ioremap(p, size, type);
+	if (v == NULL) {
+		if ((p >= TEGRA_DRAM_BASE &&
+		     (p + size) <= (TEGRA_DRAM_BASE + TEGRA_DRAM_SIZE)) ||
+		    (p >= TEGRA_NOR_FLASH_BASE &&
+		     (p + size) <= (TEGRA_NOR_FLASH_BASE + TEGRA_NOR_FLASH_SIZE)) ||
+		    (p >= TEGRA_PCIE_BASE &&
+		     (p + size) <= (TEGRA_PCIE_BASE + TEGRA_PCIE_SIZE)))
+			v = __arm_ioremap(p, size, type);
+	}
 
 	/*
 	 * If the physical address was not physical memory or statically

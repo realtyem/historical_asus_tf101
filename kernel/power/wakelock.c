@@ -62,19 +62,15 @@ int get_expired_time(struct wake_lock *lock, ktime_t *expire_time)
 	struct timespec kt;
 	struct timespec tomono;
 	struct timespec delta;
-	unsigned long seq;
+	struct timespec sleep;
 	long timeout;
 
 	if (!(lock->flags & WAKE_LOCK_AUTO_EXPIRE))
 		return 0;
-	do {
-		seq = read_seqbegin(&xtime_lock);
-		timeout = lock->expires - jiffies;
-		if (timeout > 0)
-			return 0;
-		kt = current_kernel_time();
-		tomono = __get_wall_to_monotonic();
-	} while (read_seqretry(&xtime_lock, seq));
+	get_xtime_and_monotonic_and_sleep_offset(&kt, &tomono, &sleep);
+	timeout = lock->expires - jiffies;
+	if (timeout > 0)
+		return 0;
 	jiffies_to_timespec(-timeout, &delta);
 	set_normalized_timespec(&ts, kt.tv_sec + tomono.tv_sec - delta.tv_sec,
 				kt.tv_nsec + tomono.tv_nsec - delta.tv_nsec);
@@ -266,10 +262,14 @@ extern void watchdog_disable(void);
 int suspend_process_going=0;
 extern void auto_dump_kernel_log(void);
 extern void clean_iram_log(char *string);
+static int wake_unlock_loop=0;
+extern  struct device *temp_dev;
 void suspend_worker_timeout(unsigned long data)
 {
-	printk(KERN_EMERG "**** suspend_worker_timeout\n");
+	printk(KERN_EMERG "**** suspend_worker_timeout wake_unlock_loop=%u\n",wake_unlock_loop);
 	watchdog_disable();
+	if(temp_dev)
+	printk("dpm_complete stay on : %s\n",dev_name(temp_dev) );
 	BUG();
 }
 static void suspend(struct work_struct *work)
@@ -373,7 +373,11 @@ void wake_lock_init(struct wake_lock *lock, int type, const char *name)
 	if (name)
 		lock->name = name;
 	BUG_ON(!lock->name);
-
+	if(lock->flags & WAKE_LOCK_INITIALIZED){
+		pr_info("This wake_lock has been initialized before\n");
+		WARN_ON(1);
+		return;
+	}
 	if (debug_mask & DEBUG_WAKE_LOCK)
 		pr_info("wake_lock_init name=%s\n", lock->name);
 #ifdef CONFIG_WAKELOCK_STAT
@@ -397,9 +401,15 @@ EXPORT_SYMBOL(wake_lock_init);
 void wake_lock_destroy(struct wake_lock *lock)
 {
 	unsigned long irqflags;
+	spin_lock_irqsave(&list_lock, irqflags);
 	if (debug_mask & DEBUG_WAKE_LOCK)
 		pr_info("wake_lock_destroy name=%s\n", lock->name);
-	spin_lock_irqsave(&list_lock, irqflags);
+	if(!(lock->flags & WAKE_LOCK_INITIALIZED)){
+		pr_info("This wake_lock has not been initialized before\n");
+		WARN_ON(1);
+		spin_unlock_irqrestore(&list_lock, irqflags);
+		return;
+	}
 	lock->flags &= ~WAKE_LOCK_INITIALIZED;
 #ifdef CONFIG_WAKELOCK_STAT
 	if (lock->stat.count) {
@@ -431,7 +441,12 @@ static void wake_lock_internal(
 	spin_lock_irqsave(&list_lock, irqflags);
 	type = lock->flags & WAKE_LOCK_TYPE_MASK;
 	BUG_ON(type >= WAKE_LOCK_TYPE_COUNT);
-	BUG_ON(!(lock->flags & WAKE_LOCK_INITIALIZED));
+	if(!(lock->flags & WAKE_LOCK_INITIALIZED)){
+		pr_info("wake_lock_internal:this wake_lock has not been initialized\n");
+		WARN_ON(1);
+		spin_unlock_irqrestore(&list_lock, irqflags);
+		return;
+	}
 #ifdef CONFIG_WAKELOCK_STAT
 	if (type == WAKE_LOCK_SUSPEND && wait_for_wakeup) {
 		if (debug_mask & DEBUG_WAKEUP)
@@ -492,8 +507,8 @@ static void wake_lock_internal(
 			if (expire_in == 0){
 				printk("wake_lock_internal queue suspend work\n");
 				queue_work(suspend_work_queue, &suspend_work);
-			}
 		}
+	}
 	}
 	spin_unlock_irqrestore(&list_lock, irqflags);
 }
@@ -516,12 +531,18 @@ void wake_unlock(struct wake_lock *lock)
 	unsigned long irqflags;
 	char buffer[128]={0};
 	spin_lock_irqsave(&list_lock, irqflags);
+	if(!(lock->flags & WAKE_LOCK_INITIALIZED)){
+		pr_info("Cannot unlock, wake_lock has not been initialized\n");
+		WARN_ON(1);
+		spin_unlock_irqrestore(&list_lock, irqflags);
+		return;
+	}
 	type = lock->flags & WAKE_LOCK_TYPE_MASK;
 #ifdef CONFIG_WAKELOCK_STAT
 	wake_unlock_stat_locked(lock, 0);
 #endif
 	if (debug_mask & DEBUG_WAKE_LOCK)
-	pr_info("wake_unlock: %s\n", lock->name);
+		pr_info("wake_unlock: %s\n", lock->name);
 	lock->flags &= ~(WAKE_LOCK_ACTIVE | WAKE_LOCK_AUTO_EXPIRE);
 	list_del(&lock->link);
 	list_add(&lock->link, &inactive_locks);
@@ -540,9 +561,17 @@ void wake_unlock(struct wake_lock *lock)
 					pr_info("wake_unlock: %s, stop expire "
 						"timer\n", lock->name);
 			if (has_lock == 0){
+				if(suspend_process_going){
+					wake_unlock_loop++;
+					if( ( wake_unlock_loop >= 2000 ) || (wake_unlock_loop == 1 ) ){
 				printk("wake_unlock %s queue suspend work\n",buffer);
+						wake_unlock_loop=0;
+					}
+				}
+				else
+					wake_unlock_loop=0;
 				queue_work(suspend_work_queue, &suspend_work);
-			}
+		}
 		}
 		if (lock == &main_wake_lock) {
 			if (debug_mask & DEBUG_SUSPEND)
@@ -574,7 +603,6 @@ static const struct file_operations wakelock_stats_fops = {
 	.llseek = seq_lseek,
 	.release = single_release,
 };
-
 
 static int __init wakelocks_init(void)
 {

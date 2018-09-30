@@ -17,6 +17,10 @@
   $
  */
 
+#ifndef __MPU_H_
+#error Do not include this file directly.  Include mpu.h instead.
+#endif
+
 #ifndef __MPU3050_H_
 #define __MPU3050_H_
 
@@ -24,7 +28,7 @@
 #include <linux/types.h>
 #endif
 
-#ifdef M_HW
+#if !defined CONFIG_MPU_SENSORS_MPU3050
 #error MPU6000 build including MPU3050 header
 #endif
 
@@ -145,7 +149,6 @@ enum mpu_register {
 #define BIT_OPEN                    0x40
 #define BIT_OPEN_DRAIN              0x40
 #define BIT_PUSH_PULL               0x00
-#define BIT_LATCH_INT_EN            0x20
 #define BIT_LATCH_INT_EN            0x20
 #define BIT_INT_PULSE_WIDTH_50US    0x00
 #define BIT_INT_ANYRD_2CLEAR        0x10

@@ -271,22 +271,6 @@ static int edid_checksum(unsigned char *edid)
 	if (csum == 0x00 && all_null) {
 		/* checksum passed, everything's good */
 		err = 1;
-	} else {
-		/* 1-byte-shift workaround.
-		 * It's possible to get a wrong edid with 1-byte-shift pattern
-		 * on some specific devices. Here will rearrange the wrong edid
-		 * which we get to force pass csum check. If it's still an invald
-		 * edid, edid_check_header() should return an error.
-		 */
-		int j = 0;
-		unsigned char unnecessary = 0;
-		printk("Invalid edid. Try 1-byte-shift workaround\n");
-
-		unnecessary = edid[0];
-		for(j = 0; j < EDID_LENGTH -1; j++)
-			edid[j] = edid[j+1];
-		edid[127] = 0x100 - (csum - unnecessary);
-		err = 1;
 	}
 
 	return err;
@@ -300,10 +284,8 @@ static int edid_check_header(unsigned char *edid)
 		fix_edid(edid, fix);
 
 	for (i = 0; i < 8; i++) {
-		if (edid[i] != edid_v1_header[i]) {
-			printk("edid[%d]= 0x%x != 0x%x\n", i, edid[i], edid_v1_header[i]);
+		if (edid[i] != edid_v1_header[i])
 			err = 0;
-		}
 	}
 
 	return err;
@@ -564,6 +546,9 @@ static int get_dst_timing(unsigned char *block,
 static void get_detailed_timing(unsigned char *block,
 				struct fb_videomode *mode)
 {
+	int v_size = V_SIZE;
+	int h_size = H_SIZE;
+
 	mode->xres = H_ACTIVE;
 	mode->yres = V_ACTIVE;
 	mode->pixclock = PIXEL_CLOCK;
@@ -592,11 +577,18 @@ static void get_detailed_timing(unsigned char *block,
 	}
 	mode->flag = FB_MODE_IS_DETAILED;
 
+	/* get aspect ratio */
+	if (h_size * 18 > v_size * 31 && h_size * 18 < v_size * 33)
+		mode->flag |= FB_FLAG_RATIO_16_9;
+	if (h_size * 18 > v_size * 23 && h_size * 18 < v_size * 25)
+		mode->flag |= FB_FLAG_RATIO_4_3;
+
 	DPRINTK("      %d MHz ",  PIXEL_CLOCK/1000000);
 	DPRINTK("%d %d %d %d ", H_ACTIVE, H_ACTIVE + H_SYNC_OFFSET,
 	       H_ACTIVE + H_SYNC_OFFSET + H_SYNC_WIDTH, H_ACTIVE + H_BLANKING);
 	DPRINTK("%d %d %d %d ", V_ACTIVE, V_ACTIVE + V_SYNC_OFFSET,
 	       V_ACTIVE + V_SYNC_OFFSET + V_SYNC_WIDTH, V_ACTIVE + V_BLANKING);
+	DPRINTK("%dmm %dmm ", H_SIZE, V_SIZE);
 	DPRINTK("%sHSync %sVSync\n\n", (HSYNC_POSITIVE) ? "+" : "-",
 	       (VSYNC_POSITIVE) ? "+" : "-");
 }
@@ -933,7 +925,7 @@ void fb_edid_to_monspecs(unsigned char *edid, struct fb_monspecs *specs)
 	int i, found = 0;
 
 	if (edid == NULL) {
-		printk("edid is NULL\n");
+		printk("fb_edid_to_monspecs: edid is NULL\n");
 		return;
 	}
 
@@ -993,97 +985,95 @@ void fb_edid_to_monspecs(unsigned char *edid, struct fb_monspecs *specs)
 	DPRINTK("========================================\n");
 }
 
+/**
+ * fb_edid_add_monspecs() - add monitor video modes from E-EDID data
+ * @edid:	128 byte array with an E-EDID block
+ * @specs:	monitor specs to be extended
+ */
 void fb_edid_add_monspecs(unsigned char *edid, struct fb_monspecs *specs)
 {
 	unsigned char *block;
-	unsigned char *dtd_block;
-	struct fb_videomode *mode, *m;
-	int num = 0, i, first = 1;
+	struct fb_videomode *m;
+	int num = 0, i;
+	u8 svd[64], edt[(128 - 4) / DETAILED_TIMING_DESCRIPTION_SIZE];
+	u8 pos = 4, svd_n = 0;
 
-	if (edid == NULL)
+	if (!edid)
 		return;
 
 	if (!edid_checksum(edid))
 		return;
 
-	if (edid[0] != 0x2)
+	if (edid[0] != 0x2 ||
+	    edid[2] < 4 || edid[2] > 128)
 		return;
 
-	mode = kzalloc(50 * sizeof(struct fb_videomode), GFP_KERNEL);
-	if (mode == NULL)
-		return;
+	DPRINTK("  Short Video Descriptors\n");
 
-	block = edid + 0x4;
-	dtd_block = edid + edid[0x2];
+	while (pos < edid[2]) {
+		u8 len = edid[pos] & 0x1f, type = (edid[pos] >> 5) & 7;
+		pr_debug("Data block %u of %u bytes\n", type, len);
 
-	DPRINTK("  Short Video Modes\n");
-	while (block < dtd_block) {
-		unsigned tag = block[0] >> 5;
-		unsigned len = block[0] & 0x1f;
-
-		block++;
-		if (dtd_block - block < len)
-			break;
-
-		if (tag == 0x2) {
-			for (i = 0; i < len; i++) {
-				unsigned m = block[i];
-				if (m > 0 && m < CEA_MODEDB_SIZE) {
-					memcpy(&mode[num], &cea_modes[m],
-					       sizeof(mode[num]));
-					DPRINTK("  %d: %dx%d @ %d\n", m,
-						cea_modes[m].xres, cea_modes[m].yres,
-						cea_modes[m].refresh);
-
-					num++;
-				}
+		pos++;
+		if (type == 2) {
+			for (i = pos; i < pos + len; i++) {
+				u8 idx = edid[i] & 0x7f;
+				svd[svd_n++] = idx;
+				pr_debug("N%sative mode #%d\n",
+					 edid[i] & 0x80 ? "" : "on-n", idx);
 			}
-		} else if (tag == 0x3) {
-			if (len >= 3) {
-				u32 ieee_reg = block[0] | (block[1] << 8) |
-					(block[2] << 16);
-				if (ieee_reg == 0x000c03)
-					specs->misc |= FB_MISC_HDMI;
-			}
+		} else if (type == 3 && len >= 3) {
+			u32 ieee_reg = edid[pos] | (edid[pos + 1] << 8) |
+				(edid[pos + 2] << 16);
+			if (ieee_reg == 0x000c03)
+				specs->misc |= FB_MISC_HDMI;
 		}
 
-		block += len;
+		pos += len;
 	}
+
+	block = edid + edid[2];
 
 	DPRINTK("  Extended Detailed Timings\n");
 
-	for (i = 0; i < (128 - edid[0x2]) / DETAILED_TIMING_DESCRIPTION_SIZE;
-	     i++, dtd_block += DETAILED_TIMING_DESCRIPTION_SIZE) {
-		if (!(dtd_block[0] == 0x00 && dtd_block[1] == 0x00)) {
-			get_detailed_timing(dtd_block, &mode[num]);
-			if (first) {
-			        mode[num].flag |= FB_MODE_IS_FIRST;
-				first = 0;
-			}
-			num++;
+	for (i = 0; i < (128 - edid[2]) / DETAILED_TIMING_DESCRIPTION_SIZE;
+	     i++, block += DETAILED_TIMING_DESCRIPTION_SIZE)
+		if (PIXEL_CLOCK)
+			edt[num++] = block - edid;
+
+	/* Yikes, EDID data is totally useless */
+	if (!(num + svd_n))
+		return;
+
+	m = kzalloc((specs->modedb_len + num + svd_n) *
+		       sizeof(struct fb_videomode), GFP_KERNEL);
+
+	if (!m)
+		return;
+
+	memcpy(m, specs->modedb, specs->modedb_len * sizeof(struct fb_videomode));
+
+	for (i = specs->modedb_len; i < specs->modedb_len + num; i++) {
+		get_detailed_timing(edid + edt[i - specs->modedb_len], &m[i]);
+		if (i == specs->modedb_len)
+			m[i].flag |= FB_MODE_IS_FIRST;
+		pr_debug("Adding %ux%u@%u\n", m[i].xres, m[i].yres, m[i].refresh);
+	}
+
+	for (i = specs->modedb_len + num; i < specs->modedb_len + num + svd_n; i++) {
+		int idx = svd[i - specs->modedb_len - num];
+		if (!idx || idx > (CEA_MODEDB_SIZE - 1)) {
+			pr_warning("Reserved SVD code %d\n", idx);
+		} else {
+			memcpy(&m[i], cea_modes + idx, sizeof(m[i]));
+			pr_debug("Adding SVD #%d: %ux%u@%u\n", idx,
+				 m[i].xres, m[i].yres, m[i].refresh);
 		}
 	}
 
-	/* Yikes, EDID data is totally useless */
-	if (!num) {
-		kfree(mode);
-		return;
-	}
-
-	m = kzalloc((specs->modedb_len + num) *
-		       sizeof(struct fb_videomode), GFP_KERNEL);
-
-	if (!m) {
-		kfree(mode);
-		return;
-	}
-
-	memmove(m, specs->modedb, specs->modedb_len * sizeof(struct fb_videomode));
-	memmove(m + specs->modedb_len, mode, num * sizeof(struct fb_videomode));
-	kfree(mode);
 	kfree(specs->modedb);
 	specs->modedb = m;
-	specs->modedb_len = specs->modedb_len + num;
+	specs->modedb_len = specs->modedb_len + num + svd_n;
 }
 
 /*
@@ -1402,6 +1392,9 @@ void fb_edid_to_monspecs(unsigned char *edid, struct fb_monspecs *specs)
 {
 	specs = NULL;
 }
+void fb_edid_add_monspecs(unsigned char *edid, struct fb_monspecs *specs)
+{
+}
 void fb_destroy_modedb(struct fb_videomode *modedb)
 {
 }
@@ -1509,6 +1502,7 @@ EXPORT_SYMBOL(fb_firmware_edid);
 
 EXPORT_SYMBOL(fb_parse_edid);
 EXPORT_SYMBOL(fb_edid_to_monspecs);
+EXPORT_SYMBOL(fb_edid_add_monspecs);
 EXPORT_SYMBOL(fb_get_mode);
 EXPORT_SYMBOL(fb_validate_mode);
 EXPORT_SYMBOL(fb_destroy_modedb);

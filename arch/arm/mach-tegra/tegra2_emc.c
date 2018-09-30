@@ -1,8 +1,8 @@
 /*
- * Copyright (C) 2010 Google, Inc.
+ * Copyright (C) 2011 Google, Inc.
  *
  * Author:
- *	Colin Cross <ccross@google.com>
+ *	Colin Cross <ccross@android.com>
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -40,6 +40,9 @@ module_param(emc_enable, bool, 0644);
 static void __iomem *emc = IO_ADDRESS(TEGRA_EMC_BASE);
 static const struct tegra_emc_table *tegra_emc_table;
 static int tegra_emc_table_size;
+
+static unsigned long tegra_emc_max_bus_rate;  /* 2 * 1000 * maximum emc_clock rate */
+static unsigned long tegra_emc_min_bus_rate;  /* 2 * 1000 * minimum emc_clock rate */
 
 static inline void emc_writel(u32 val, unsigned long addr)
 {
@@ -145,10 +148,20 @@ long tegra_emc_round_rate(unsigned long rate)
 		printk("%s: emc_enable is null\n", __func__);
 		return -EINVAL;
 	}
+	if (rate >= tegra_emc_max_bus_rate) {
+		best = tegra_emc_table_size - 1;
+		goto round_out;
+	} else if (rate <= tegra_emc_min_bus_rate) {
+		best = 0;
+		goto round_out;
+	}
 
 	pr_debug("%s: %lu\n", __func__, rate);
-	/* The EMC clock rate is twice the bus rate, and the bus rate is
-	 * measured in kHz */
+
+	/*
+	 * The EMC clock rate is twice the bus rate, and the bus rate is
+	 * measured in kHz
+	 */
 	rate = rate / 2 / 1000;
 
 	for (i = 0; i < tegra_emc_table_size; i++) {
@@ -162,19 +175,21 @@ long tegra_emc_round_rate(unsigned long rate)
 	if (best < 0){
 		printk("%s: best < 0\n", __func__);
 		return -EINVAL;
-		}
-
+	}
+round_out:
 	pr_debug("%s: using %lu\n", __func__, tegra_emc_table[best].rate);
 
 	return tegra_emc_table[best].rate * 2 * 1000;
 }
 
-/* The EMC registers have shadow registers.  When the EMC clock is updated
+/*
+ * The EMC registers have shadow registers.  When the EMC clock is updated
  * in the clock controller, the shadow registers are copied to the active
  * registers, allowing glitchless memory bus frequency changes.
  * This function updates the shadow registers for a new clock frequency,
  * and relies on the clock lock on the emc clock to avoid races between
- * multiple frequency changes */
+ * multiple frequency changes
+ */
 int tegra_emc_set_rate(unsigned long rate)
 {
 	int i;
@@ -184,9 +199,10 @@ int tegra_emc_set_rate(unsigned long rate)
 		printk("faile! 1 no tegra_emc_table+\n");
 		return -EINVAL;
 	}
-
-	/* The EMC clock rate is twice the bus rate, and the bus rate is
-	 * measured in kHz */
+	/*
+	 * The EMC clock rate is twice the bus rate, and the bus rate is
+	 * measured in kHz
+	 */
 	rate = rate / 2 / 1000;
 
 	for (i = 0; i < tegra_emc_table_size; i++)
@@ -198,7 +214,7 @@ int tegra_emc_set_rate(unsigned long rate)
 		return -EINVAL;
 	}
 
-	//printk("%s: setting to %lu\n", __func__, rate);
+	pr_debug("%s: setting to %lu\n", __func__, rate);
 
 	for (j = 0; j < TEGRA_EMC_NUM_REGS; j++)
 		emc_writel(tegra_emc_table[i].regs[j], emc_reg_addr[j]);
@@ -207,6 +223,7 @@ int tegra_emc_set_rate(unsigned long rate)
 
 	return 0;
 }
+
 void tegra_init_emc(const struct tegra_emc_chip *chips, int chips_size)
 {
 	int i;
@@ -215,6 +232,7 @@ void tegra_init_emc(const struct tegra_emc_chip *chips, int chips_size)
 	int rev_id2;
 	int pid;
 	int chip_matched = -1;
+
 	vid = tegra_emc_read_mrr(5);
 	rev_id1 = tegra_emc_read_mrr(6);
 	rev_id2 = tegra_emc_read_mrr(7);
@@ -247,6 +265,10 @@ void tegra_init_emc(const struct tegra_emc_chip *chips, int chips_size)
 			chips[chip_matched].description,chips[chip_matched].mem_manufacturer_id,chips[chip_matched].mem_revision_id1,chips[chip_matched].mem_revision_id2);
 		tegra_emc_table = chips[chip_matched].table;
 		tegra_emc_table_size = chips[chip_matched].table_size;
+
+		tegra_emc_min_bus_rate = tegra_emc_table[0].rate * 2 * 1000;
+		tegra_emc_max_bus_rate = tegra_emc_table[tegra_emc_table_size - 1].rate * 2 * 1000;
+
 	} else {
 		printk("%s: Memory not recognized, memory scaling disabled\n",
 			__func__);
@@ -256,4 +278,3 @@ void tegra_init_emc(const struct tegra_emc_chip *chips, int chips_size)
 		printk("%s: Memory pid     = 0x%04x", __func__, pid);
 	}
 }
-

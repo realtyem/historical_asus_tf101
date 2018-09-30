@@ -27,6 +27,7 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <media/yuv_sensor.h>
+#include <linux/debugfs.h>
 
 #define SENSOR_WIDTH_REG 0x2703
 #define SENSOR_640_WIDTH_VAL 0x0280
@@ -40,6 +41,9 @@
 #define SENSOR_MASK_WORD_WRITE  (SEQUENCE_END+4)
 #define SENSOR_BYTE_READ  (SEQUENCE_END+5)
 #define SENSOR_WORD_READ  (SEQUENCE_END+6)
+
+/* Store what you got in previous dbg_get_mi1040_reg_write(). */
+static int g_under_the_table = 0;
 
 struct sensor_reg {
 	u16 addr;
@@ -58,8 +62,8 @@ struct sensor_info {
 	struct yuv_sensor_platform_data *pdata;
 };
 
+static bool sensor_opened = false;
 static struct sensor_info *info;
-
 static struct sensor_reg_ex mode_1280x960[] =
 {
 //+
@@ -322,9 +326,9 @@ static struct sensor_reg_ex mode_1280x960[] =
 {SENSOR_WORD_WRITE,0xC914, 0x0000} , 	// CAM_STAT_AWB_CLIP_WINDOW_XSTART
 {SENSOR_WORD_WRITE,0xC916, 0x0000} , 	// CAM_STAT_AWB_CLIP_WINDOW_YSTART
 {SENSOR_WORD_WRITE,0xC918, 0x04FF} , 	// CAM_STAT_AWB_CLIP_WINDOW_XEND
-{SENSOR_WORD_WRITE,0xC91A, 0x02CF} , 	// CAM_STAT_AWB_CLIP_WINDOW_YEND
-{SENSOR_WORD_WRITE,0xC904, 0x0033} , 	// CAM_AWB_AWB_XSHIFT_PRE_ADJ
-{SENSOR_WORD_WRITE,0xC906, 0x0040} , 	// CAM_AWB_AWB_YSHIFT_PRE_ADJ
+{SENSOR_WORD_WRITE,0xC91A, 0x03BF} , 	// CAM_STAT_AWB_CLIP_WINDOW_YEND
+{SENSOR_WORD_WRITE,0xC904, 0x003B} , 	// CAM_AWB_AWB_XSHIFT_PRE_ADJ
+{SENSOR_WORD_WRITE,0xC906, 0x0041} , 	// CAM_AWB_AWB_YSHIFT_PRE_ADJ
 {SENSOR_BYTE_WRITE,0xC8F2, 0x03} , 	// CAM_AWB_AWB_XSCALE
 {SENSOR_BYTE_WRITE,0xC8F3, 0x02} , 	// CAM_AWB_AWB_YSCALE
 {SENSOR_WORD_WRITE,0xC906, 0x003C} , 	// CAM_AWB_AWB_YSHIFT_PRE_ADJ
@@ -768,6 +772,33 @@ static struct sensor_reg_ex EV_minus_2[] = {
 
 //-
 
+/* ++ AE Lock & AE Unlock ++ */
+static struct sensor_reg_ex AE_lock_seq[] = {
+{SENSOR_WORD_WRITE,0x098E, 0xCC00} ,	// LOGICAL_ADDRESS_ACCESS [UVC_AE_MODE_CONTROL]
+{SENSOR_BYTE_WRITE,0xCC00, 0x01} ,	// UVC_AE_MODE_CONTROL - manual exposure
+{SENSOR_TABLE_END, 0x0000}
+};
+
+static struct sensor_reg_ex AE_unlock_seq[] = {
+{SENSOR_WORD_WRITE,0x098E, 0xCC00} ,	// LOGICAL_ADDRESS_ACCESS [UVC_AE_MODE_CONTROL]
+{SENSOR_BYTE_WRITE,0xCC00, 0x02} ,	// UVC_AE_MODE_CONTROL - auto exposure
+{SENSOR_TABLE_END, 0x0000}
+};
+/* -- AE Lock & AE Unlock --*/
+
+/* ++ AWB Lock & AWB Unlock ++ */
+static struct sensor_reg_ex AWB_lock_seq[] = {
+{SENSOR_WORD_WRITE,0x098E, 0xCC01} ,	// LOGICAL_ADDRESS_ACCESS [UVC_AE_MODE_CONTROL]
+{SENSOR_BYTE_WRITE,0xCC01, 0x00} ,	// UVC_WHITE_BALANCE_TEMPERATURE_AUTO_CONTROL - manual white balance
+{SENSOR_TABLE_END, 0x0000}
+};
+
+static struct sensor_reg_ex AWB_unlock_seq[] = {
+{SENSOR_WORD_WRITE,0x098E, 0xCC01} ,	// LOGICAL_ADDRESS_ACCESS [UVC_AE_MODE_CONTROL]
+{SENSOR_BYTE_WRITE,0xCC01, 0x01} ,	// UVC_WHITE_BALANCE_TEMPERATURE_AUTO_CONTROL - auto white balance
+{SENSOR_TABLE_END, 0x0000}
+};
+/* -- AWB Lock & AWB Unlock --*/
 
 static struct sensor_reg Autofocus_Trigger[] = {
 //[8.2 AF - Full Scan ON]
@@ -860,6 +891,42 @@ static int sensor_read_reg_word(struct i2c_client *client, u16 addr, u16 *val)
 	return 0;
 }
 
+static int sensor_read_reg_dword(struct i2c_client *client, u16 addr, u32 *val)
+{
+	int err;
+	struct i2c_msg msg[2];
+	unsigned char data[6];
+
+	if (!client->adapter)
+		return -ENODEV;
+
+	msg[0].addr = client->addr;
+	msg[0].flags = 0;
+	msg[0].len = 2;
+	msg[0].buf = data;
+
+	/* high byte goes out first */
+	data[0] = (u8) (addr >> 8);;
+	data[1] = (u8) (addr & 0xff);
+
+	msg[1].addr = client->addr;
+	msg[1].flags = I2C_M_RD;
+	msg[1].len = 4;
+	msg[1].buf = data + 2;
+
+	err = i2c_transfer(client->adapter, msg, 2);
+
+	if (err != 2)
+		return -EINVAL;
+
+	/* swap high and low byte to match table format */
+	swap(*(data+2),*(data+5));
+	swap(*(data+3),*(data+4));
+	memcpy(val, data+2, 4);
+
+	return 0;
+}
+
 static int sensor_write_reg(struct i2c_client *client, u16 addr, u16 val)
 {
 	int err;
@@ -910,6 +977,43 @@ static int sensor_write_reg_word(struct i2c_client *client, u16 addr, u16 val)
 	msg.addr = client->addr;
 	msg.flags = 0;
 	msg.len = 4;
+	msg.buf = data;
+
+	do {
+		err = i2c_transfer(client->adapter, &msg, 1);
+		if (err == 1)
+			return 0;
+		retry++;
+		pr_err("yuv_sensor : i2c transfer failed, retrying %x %x\n",
+		       addr, val);
+		pr_err("yuv_sensor : i2c transfer failed, count %x \n",
+		       msg.addr);
+	} while (retry <= SENSOR_MAX_RETRIES);
+
+	return err;
+}
+
+static int sensor_write_reg_dword(struct i2c_client *client, u16 addr, u32 val)
+{
+	int err;
+	struct i2c_msg msg;
+	unsigned char data[6];
+	int retry = 0;
+
+	if (!client->adapter)
+		return -ENODEV;
+
+	data[0] = (u8) (addr >> 8);
+	data[1] = (u8) (addr & 0xff);
+
+	data[2] = (u8) ((val >> 24) & 0xff);
+	data[3] = (u8) ((val >> 16) & 0xff);
+	data[4] = (u8) ((val >> 8) & 0xff);
+	data[5] = (u8) (val & 0xff);
+
+	msg.addr = client->addr;
+	msg.flags = 0;
+	msg.len = 6;
 	msg.buf = data;
 
 	do {
@@ -982,6 +1086,256 @@ static int sensor_write_table_ex(struct i2c_client *client,
 	}
 	return 0;
 }
+
+/* debugfs+ */
+/* --- mi1040_chip_id --- */
+int tegra_camera_mclk_on_off(int on);
+
+static ssize_t dbg_mi1040_chip_id_open(struct inode *inode, struct file *file)
+{
+	file->private_data = inode->i_private;
+	return 0;
+}
+
+static ssize_t dbg_mi1040_chip_id_read(struct file *file, char __user *buf, size_t count,
+				loff_t *ppos)
+{
+	int len = 0;
+	int tot = 0;
+	char debug_buf[256];
+	int dlen = sizeof(debug_buf);
+	char *bp = debug_buf;
+
+	u16 chip_id = 0x0;
+	int err = 0;
+
+	printk("%s: buf=%p, count=%d, ppos=%p; *ppos= %d\n", __FUNCTION__, buf, count, ppos, *ppos);
+
+	if (*ppos)
+		return 0;	/* the end */
+
+	if (sensor_opened == false) {
+		if (info->pdata && info->pdata->power_on)
+			info->pdata->power_on();
+		else {
+			len = snprintf(bp, dlen, "mi1040 info isn't enough for power_on.\n");
+			tot += len; bp += len; dlen -= len;
+		}
+		tegra_camera_mclk_on_off(1);
+	}
+
+	err = sensor_read_reg_word(info->i2c_client, 0x0, &chip_id);
+	len = snprintf(bp, dlen, "chip_id= 0x%x, err= %d\n", chip_id, err);
+	tot += len; bp += len; dlen -= len;
+
+	if (sensor_opened == false) {
+		tegra_camera_mclk_on_off(0);
+
+		if (info->pdata && info->pdata->power_off) {
+			info->pdata->power_off();
+		} else {
+			len = snprintf(bp, dlen, "mi1040 info isn't enough for power_off.\n");
+			tot += len; bp += len; dlen -= len;
+		}
+	}
+
+	if (copy_to_user(buf, debug_buf, tot))
+		return -EFAULT;
+	if (tot < 0)
+		return 0;
+	*ppos += tot;	/* increase offset */
+	return tot;
+}
+
+static const struct file_operations dbg_mi1040_chip_id_fops = {
+	.open		= dbg_mi1040_chip_id_open,
+	.read		= dbg_mi1040_chip_id_read,
+};
+
+/* --- get_mi1040_reg --- */
+static ssize_t dbg_get_mi1040_reg_open(struct inode *inode, struct file *file)
+{
+	file->private_data = inode->i_private;
+	return 0;
+}
+
+static ssize_t dbg_get_mi1040_reg_write(struct file *file, char __user *buf, size_t count,
+				loff_t *ppos)
+{
+	char debug_buf[256];
+	int cnt, byte_num = 0;
+	char ofst_str[7];
+	unsigned int ofst = 0;
+	unsigned int val = 0;
+
+	printk("%s: buf=%p, count=%d, ppos=%p\n", __FUNCTION__, buf, count, ppos);
+	if (count > sizeof(debug_buf))
+		return -EFAULT;
+	if (copy_from_user(debug_buf, buf, count))
+		return -EFAULT;
+	debug_buf[count] = '\0';	/* end of string */
+	cnt = sscanf(debug_buf, "%s %d", ofst_str, &byte_num);
+
+	if (sensor_opened == false) {
+			printk("%s: Please open mi1040 first.\n", __FUNCTION__);
+	} else {
+		/* Str to Int*/
+		if ((ofst_str[0] == '0') && (ofst_str[1] == 'x')) {
+			/* Parse ofst */
+			int i = 0;
+			int err = 0;
+
+			for (i = 2; i < 6; i++) {
+				if ((ofst_str[i] >= '0') && (ofst_str[i] <= '9'))
+					ofst = ofst * 16 + ofst_str[i] - '0';
+				else if ((ofst_str[i] >= 'a') && (ofst_str[i] <= 'f'))
+					ofst = ofst * 16 + ofst_str[i] - 'a' + 10;
+				else if ((ofst_str[i] >= 'A') && (ofst_str[i] <= 'F'))
+					ofst = ofst * 16 + ofst_str[i] - 'A' + 10;
+				else {
+					break;
+				}
+			}
+
+			/* Write the Reg */
+			printk("Offset= %d(0x%x); byte_num= %d\n", ofst, ofst, byte_num);
+			if (byte_num == 1)
+				err = sensor_read_reg(info->i2c_client, ofst, &val);
+			else if (byte_num == 2)
+				err = sensor_read_reg_word(info->i2c_client, ofst, &val);
+			else if (byte_num == 4)
+				err = sensor_read_reg_dword(info->i2c_client, ofst, &val);
+			else {
+				printk("%s: Byte Num should be 1, 2 or 4.\n", __FUNCTION__);
+				err = -1;
+			}
+
+			if (err == 0) {
+				g_under_the_table = val;
+				printk("0x%x\n", val);
+			} else {
+				g_under_the_table = 0xabcdabcd;
+				printk("%s: Read Reg Error: %d\n", __FUNCTION__, err);
+			}
+		} else {
+			/* Wrong Usage */
+			printk("%s: Wrong Format.\n", __FUNCTION__);
+			printk("Usage: echo [Reg Ofst] [Byte Num] > /d/mi1040/get_reg\n");
+			printk("EX: echo 0x0 2 > /d/mi1040/get_reg\n");
+		}
+	}
+	return count;
+}
+
+static const struct file_operations dbg_get_mi1040_reg_fops = {
+	.open		= dbg_get_mi1040_reg_open,
+	.write		= dbg_get_mi1040_reg_write,
+};
+
+/* --- set_mi1040_reg --- */
+static ssize_t dbg_set_mi1040_reg_open(struct inode *inode, struct file *file)
+{
+	file->private_data = inode->i_private;
+	return 0;
+}
+
+static ssize_t dbg_set_mi1040_reg_write(struct file *file, char __user *buf, size_t count,
+				loff_t *ppos)
+{
+	char debug_buf[256];
+	int cnt, byte_num;
+	char ofst_str[7], reg_val_str[11];
+	unsigned int ofst, reg_val= 0;
+
+	printk("%s: buf=%p, count=%d, ppos=%p\n", __FUNCTION__, buf, count, ppos);
+	if (count > sizeof(debug_buf))
+		return -EFAULT;
+	if (copy_from_user(debug_buf, buf, count))
+		return -EFAULT;
+	debug_buf[count] = '\0';	/* end of string */
+	cnt = sscanf(debug_buf, "%s %s %d", ofst_str, reg_val_str, &byte_num);
+
+	printk("adogu: cnt= %d; ofst_str=\"%s\"; reg_val_str=\"%s\"; byte_num= %d\n", cnt, ofst_str, reg_val_str, byte_num);
+
+	if (sensor_opened == false) {
+			printk("%s: Please open mi1040 first.\n", __FUNCTION__);
+	} else {
+		/* Str to Int*/
+		if (((ofst_str[0] == '0') && (ofst_str[1] == 'x')) &&
+			((reg_val_str[0]=='0')) && (reg_val_str[1]=='x')) {
+			/* Parse ofst */
+			int i = 0;
+			int err = 0;
+
+			/* Parse Reg Offset */
+			for (i = 2; i < 6; i++) {
+				if ((ofst_str[i] >= '0') && (ofst_str[i] <= '9'))
+					ofst = ofst * 16 + ofst_str[i] - '0';
+				else if ((ofst_str[i] >= 'a') && (ofst_str[i] <= 'f'))
+					ofst = ofst * 16 + ofst_str[i] - 'a' + 10;
+				else if ((ofst_str[i] >= 'A') && (ofst_str[i] <= 'F'))
+					ofst = ofst * 16 + ofst_str[i] - 'A' + 10;
+				else {
+					break;
+				}
+			}
+			ofst &= 0xFFFF;
+
+			/* Parse Reg Value */
+			for (i = 2; i < 11; i++) {
+				// printk("adogu: i =%d\n", i);
+
+				if ((reg_val_str[i] >= '0') && (reg_val_str[i] <= '9'))
+					reg_val = reg_val * 16 + reg_val_str[i] - '0';
+				else if ((reg_val_str[i] >= 'a') && (reg_val_str[i] <= 'f'))
+					reg_val = reg_val * 16 + reg_val_str[i] - 'a' + 10;
+				else if ((reg_val_str[i] >= 'A') && (reg_val_str[i] <= 'F'))
+					reg_val = reg_val * 16 + reg_val_str[i] - 'A' + 10;
+				else {
+					break;
+				}
+			}
+
+			/* Write the Reg */
+			printk("Offset= %d(0x%x); Reg_Val= %d(0x%x)\n", ofst, ofst, reg_val, reg_val);
+			if (byte_num == 2) {
+				reg_val &= 0xFFFF;
+				printk("%s: sensor_write_reg_word(0x%04x, 0x%04x)\n", __FUNCTION__, ofst, reg_val);
+				err = sensor_write_reg_word(info->i2c_client, ofst, reg_val);
+			}
+			else if (byte_num == 1) {
+				reg_val &= 0xFF;
+				printk("%s: sensor_write_reg(0x%04x, 0x%02x)\n", __FUNCTION__, ofst, reg_val);
+				err = sensor_write_reg(info->i2c_client, ofst, reg_val);
+			} else if (byte_num == 4) {
+				printk("%s: sensor_write_reg_dword(0x%04x, 0x%08x)\n", __FUNCTION__, ofst, reg_val);
+				err = sensor_write_reg_dword(info->i2c_client, ofst, reg_val);
+			} else {
+				printk("%s: Byte Num should be 1, 2 or 4.\n", __FUNCTION__);
+				err = -1;
+			}
+			if (err == 0) {
+				printk("%s: Set Reg successfully\n", __FUNCTION__);
+			} else {
+				printk("%s: Read Reg Error: %d\n", __FUNCTION__, err);
+			}
+		} else {
+			/* Wrong Usage */
+			printk("%s: Wrong Format.\n", __FUNCTION__);
+			printk("Usage: echo [Reg Ofst] [Reg Val] [Byte Num]> /d/mi1040/set_reg\n");
+			printk("EX: echo 0x098e 0xc874 2 > /d/mi1040/set_reg\n");
+		}
+	}
+
+	return count;
+}
+
+static const struct file_operations dbg_set_mi1040_reg_fops = {
+	.open		= dbg_set_mi1040_reg_open,
+	.write		= dbg_set_mi1040_reg_write,
+};
+/* debugfs- */
+
 static int get_sensor_current_width(struct i2c_client *client, u16 *val)
 {
         int err;
@@ -1033,7 +1387,7 @@ static long sensor_ioctl(struct file *file,
 			 unsigned int cmd, unsigned long arg)
 {
 	struct sensor_info *info = file->private_data;
-        int err=0;
+	int err=0;
 
 	pr_info("yuv %s\n",__func__);
 	switch (cmd) {
@@ -1053,168 +1407,291 @@ static long sensor_ioctl(struct file *file,
 
 		return 0;
 	}
-    case SENSOR_IOCTL_SET_COLOR_EFFECT:
-    {
-      u8 coloreffect;
+	case SENSOR_IOCTL_SET_COLOR_EFFECT:
+	{
+		u8 coloreffect;
 
-      if (copy_from_user(&coloreffect,(const void __user *)arg,
-        sizeof(coloreffect))) {
-        return -EFAULT;
-      }
+		if (copy_from_user(&coloreffect,(const void __user *)arg,
+			sizeof(coloreffect))) {
+			return -EFAULT;
+		}
 
-      switch(coloreffect)
-      {
-        case YUV_ColorEffect_None:
-          err = sensor_write_table_ex(info->i2c_client, ColorEffect_None);
-          break;
-        case YUV_ColorEffect_Mono:
-          err = sensor_write_table_ex(info->i2c_client, ColorEffect_Mono);
-          break;
-        case YUV_ColorEffect_Sepia:
-          err = sensor_write_table_ex(info->i2c_client, ColorEffect_Sepia);
-          break;
-        case YUV_ColorEffect_Negative:
-          err = sensor_write_table_ex(info->i2c_client, ColorEffect_Negative);
-          break;
-        case YUV_ColorEffect_Solarize:
-          err = sensor_write_table_ex(info->i2c_client, ColorEffect_Solarize);
-          break;
-        case YUV_ColorEffect_Posterize:
-          err = sensor_write_table_ex(info->i2c_client, ColorEffect_Posterize);
-          break;
-        default:
-          break;
-      }
+		switch(coloreffect) {
+		case YUV_ColorEffect_None:
+			err = sensor_write_table_ex(info->i2c_client, ColorEffect_None);
+			break;
+		case YUV_ColorEffect_Mono:
+			err = sensor_write_table_ex(info->i2c_client, ColorEffect_Mono);
+			break;
+		case YUV_ColorEffect_Sepia:
+			err = sensor_write_table_ex(info->i2c_client, ColorEffect_Sepia);
+			break;
+		case YUV_ColorEffect_Negative:
+			err = sensor_write_table_ex(info->i2c_client, ColorEffect_Negative);
+			break;
+		case YUV_ColorEffect_Solarize:
+			err = sensor_write_table_ex(info->i2c_client, ColorEffect_Solarize);
+			break;
+		case YUV_ColorEffect_Posterize:
+			err = sensor_write_table_ex(info->i2c_client, ColorEffect_Posterize);
+			break;
+		default:
+			break;
+		}
 
-      if (err)
-      return err;
+		if (err)
+			return err;
 
-      return 0;
-    }
-    case SENSOR_IOCTL_SET_WHITE_BALANCE:
-    {
-      u8 whitebalance;
+		return 0;
+	}
+	case SENSOR_IOCTL_SET_WHITE_BALANCE:
+	{
+		u8 whitebalance;
 
-      if (copy_from_user(&whitebalance,(const void __user *)arg,
-        sizeof(whitebalance))) {
-        return -EFAULT;
-      }
-      printk("0x%X,0x%X\n",SENSOR_CUSTOM_IOCTL_GET_EV,SENSOR_CUSTOM_IOCTL_SET_EV);
-      switch(whitebalance)
-      {
-        case YUV_Whitebalance_Auto:
-          printk("=================WB: Auto\n");
-          err = sensor_write_table_ex(info->i2c_client, Whitebalance_Auto);
-          break;
-        case YUV_Whitebalance_Incandescent:
-          printk("=================WB: Incandescent\n");
-          err = sensor_write_table_ex(info->i2c_client, Whitebalance_Incandescent);
-          break;
-        case YUV_Whitebalance_Daylight:
-          err = sensor_write_table_ex(info->i2c_client, Whitebalance_Daylight);
-          printk("=================WB: Daylight\n");
-          break;
-        case YUV_Whitebalance_Fluorescent:
-          printk("=================WB: Fluorescent\n");
-          err = sensor_write_table_ex(info->i2c_client, Whitebalance_Fluorescent);
-          break;
-        default:
-          break;
-      }
+		if (copy_from_user(&whitebalance,(const void __user *)arg,
+			sizeof(whitebalance))) {
+			return -EFAULT;
+		}
 
-      if (err)
-        return err;
+		switch(whitebalance) {
+		case YUV_Whitebalance_Auto:
+			printk("=================WB: Auto\n");
+			err = sensor_write_table_ex(info->i2c_client, Whitebalance_Auto);
+			break;
+		case YUV_Whitebalance_Incandescent:
+			printk("=================WB: Incandescent\n");
+			err = sensor_write_table_ex(info->i2c_client, Whitebalance_Incandescent);
+			break;
+		case YUV_Whitebalance_Daylight:
+			err = sensor_write_table_ex(info->i2c_client, Whitebalance_Daylight);
+			printk("=================WB: Daylight\n");
+			break;
+		case YUV_Whitebalance_Fluorescent:
+			printk("=================WB: Fluorescent\n");
+			err = sensor_write_table_ex(info->i2c_client, Whitebalance_Fluorescent);
+			break;
+		default:
+			break;
+		}
 
-      return 0;
-    }
+		if (err)
+			return err;
 
-    case SENSOR_IOCTL_SET_SCENE_MODE:
-    {
-            return 0;
-    }
-    case SENSOR_CUSTOM_IOCTL_SET_EV:
-    {
-      short ev;
+		return 0;
+	}
 
-      if (copy_from_user(&ev,(const void __user *)arg, sizeof(short)))
-      {
-        return -EFAULT;
-      }
+	case SENSOR_IOCTL_SET_SCENE_MODE:
+	{
+		return 0;
+	}
+	case SENSOR_CUSTOM_IOCTL_SET_EV:
+	{
+		short ev;
 
-      printk("SET_EV as %d\n",ev);
+		if (copy_from_user(&ev,(const void __user *)arg, sizeof(short))) {
+			return -EFAULT;
+		}
 
-      if (ev == -2)
-        err = sensor_write_table_ex(info->i2c_client, EV_minus_2);
-      else if (ev == -1)
-        err = sensor_write_table_ex(info->i2c_client, EV_minus_1);
-      else if (ev == 0)
-        err = sensor_write_table_ex(info->i2c_client, EV_zero);
-      else if (ev == 1)
-        err = sensor_write_table_ex(info->i2c_client, EV_plus_1);
-      else if (ev == 2)
-        err = sensor_write_table_ex(info->i2c_client, EV_plus_2);
-      else
-        err = -1;
+		printk("SET_EV as %d\n",ev);
 
-      if (err)
-        return err;
-      return 0;
-    }
+		if (ev == -2)
+			err = sensor_write_table_ex(info->i2c_client, EV_minus_2);
+		else if (ev == -1)
+			err = sensor_write_table_ex(info->i2c_client, EV_minus_1);
+		else if (ev == 0)
+			err = sensor_write_table_ex(info->i2c_client, EV_zero);
+		else if (ev == 1)
+			err = sensor_write_table_ex(info->i2c_client, EV_plus_1);
+		else if (ev == 2)
+			err = sensor_write_table_ex(info->i2c_client, EV_plus_2);
+		else
+			err = -1;
 
-    case SENSOR_CUSTOM_IOCTL_GET_EV:
-    {
-      short ev;
-      u16 val;
+		if (err)
+			return err;
+		return 0;
+	}
 
-      sensor_write_reg_word(info->i2c_client, 0x098E, 0xC874);
-      err = sensor_read_reg(info->i2c_client, 0xC87A, &val);
+	case SENSOR_CUSTOM_IOCTL_GET_EV:
+	{
+		short ev;
+		u16 val;
 
-      printk("GET_EV: val=0x%X\n",val);
+		sensor_write_reg_word(info->i2c_client, 0x098E, 0xC874);
+		err = sensor_read_reg(info->i2c_client, 0xC87A, &val);
 
-      if (err)
-        return err;
+		printk("GET_EV: val=0x%X\n",val);
 
-      printk("GET_EV: val=0x%X\n",val);
+		if (err) {
+			printk("IOCTL_GET_EV fail: err= 0x%x\n", err);
+			return err;
+		}
 
-      if (val <= 0x32)
-        ev=-2;
-      else if (val <= 0x36)
-        ev=-1;
-      else if (val <= 0x3c)
-        ev=0;
-      else if (val <= 0x42)
-        ev=1;
-      else if (val > 0x42)
-        ev=2;
-      if (copy_to_user((const void __user *)arg, &ev, sizeof(short)))
-      {
-        return -EFAULT;
-      }
-      if (err)
-        return err;
+		if (val <= 0x32)
+			ev=-2;
+		else if (val <= 0x36)
+			ev=-1;
+		else if (val <= 0x3c)
+			ev=0;
+		else if (val <= 0x42)
+			ev=1;
+		else if (val > 0x42)
+			ev=2;
+		if (copy_to_user((const void __user *)arg, &ev, sizeof(short))) {
+			return -EFAULT;
+		}
+		if (err)
+			return err;
 
-      return 0;
-    }
+		return 0;
+	}
 
-  	default:
-  		return -EINVAL;
+	case SENSOR_CUSTOM_IOCTL_GET_AE_LOCK:
+	{
+		u32 aelock = 0;
+		u16 val;
+
+		sensor_write_reg_word(info->i2c_client, 0x098E, 0xCC00);
+		err = sensor_read_reg(info->i2c_client, 0xCC00, &val);
+
+	      if (err) {
+			printk("SENSOR_CUSTOM_IOCTL_GET_AELOCK fail: err= 0x%x\n", err);
+			return err;
+		}
+		val &= 0xF;
+		printk("GET_AELOCK: val=0x%x\n",val);
+
+		if((val == 0x1) ||(val == 0x4)) {
+			printk("AE is locked.\n");
+			aelock = 1;
+		} else if ((val == 0x2) || (val == 0x8)) {
+			printk("AE is unlocked.\n");
+			aelock = 0;
+		}else
+			printk("AELOCK Unknown State: 0x%x???\n", val);
+
+		if (copy_to_user((const void __user *)arg, &aelock, sizeof(u32)))
+		{
+			return -EFAULT;
+		}
+
+		return 0;
+	}
+
+	case SENSOR_CUSTOM_IOCTL_SET_AE_LOCK:
+	{
+		u32 aelock;
+
+		if (copy_from_user(&aelock,(const void __user *)arg, sizeof(u32)))
+		{
+			printk("SET_AELOCK : EFAULT\n");
+			return -EFAULT;
+		}
+		aelock &= 0x1;
+		printk("SET_AELOCK as %d\n",aelock);
+
+		if (aelock == 1)
+			err = sensor_write_table_ex(info->i2c_client, AE_lock_seq);
+		else if (aelock == 0)
+			err = sensor_write_table_ex(info->i2c_client, AE_unlock_seq);
+		else
+			err = -1;
+
+		if (err) {
+			printk("AELOCK fail: 0x%x\n", err);
+			return err;
+		}
+		return 0;
+	}
+
+	case SENSOR_CUSTOM_IOCTL_GET_AWB_LOCK:
+	{
+		u32 awblock = 0;
+		u16 val;
+
+		sensor_write_reg_word(info->i2c_client, 0x098E, 0xCC01);
+		err = sensor_read_reg(info->i2c_client, 0xCC01, &val);
+
+		if (err) {
+			printk("SENSOR_CUSTOM_IOCTL_GET_AWBLOCK fail: err= 0x%x\n", err);
+			return err;
+		}
+		val &= 0x1;
+		printk("GET_AWBLOCK: val=0x%x\n",val);
+
+		if(val == 0x0) {
+			printk("AWB_LOCK is locked.\n");
+			awblock = 1;
+		} else if (val == 0x1) {
+			printk("AWB_LOCK is unlocked.\n");
+			awblock = 0;
+		}else
+			printk("AWBLOCK Unknown State???\n");
+
+		if (copy_to_user((const void __user *)arg, &awblock, sizeof(u32)))
+		{
+			return -EFAULT;
+		}
+
+		return 0;
+	}
+
+	case SENSOR_CUSTOM_IOCTL_SET_AWB_LOCK:
+	{
+		u32 awblock;
+
+		if (copy_from_user(&awblock,(const void __user *)arg, sizeof(u32)))
+		{
+			printk("SET_AWBLOCK : EFAULT\n");
+			return -EFAULT;
+		}
+		awblock &= 0x1;
+		printk("SET_AWBLOCK as %d\n",awblock);
+
+		if (awblock == 1)
+			err = sensor_write_table_ex(info->i2c_client, AWB_lock_seq);
+		else if (awblock == 0)
+			err = sensor_write_table_ex(info->i2c_client, AWB_unlock_seq);
+		else
+			err = -1;
+
+		if (err) {
+			printk("AWBLOCK fail???\n");
+			return err;
+		}
+
+		return 0;
+	}
+
+	default:
+		return -EINVAL;
 	}
 	return 0;
 }
 
 static int sensor_open(struct inode *inode, struct file *file)
 {
+	int ret;
+
 	pr_info("yuv %s\n",__func__);
 	file->private_data = info;
 	if (info->pdata && info->pdata->power_on)
-		info->pdata->power_on();
+		ret = info->pdata->power_on();
+	if (ret == 0)
+		sensor_opened = true;
+	else{
+		sensor_opened = false;
+		return -EBUSY;
+	}
 	return 0;
 }
 
 int mi1040_sensor_release(struct inode *inode, struct file *file)
 {
-	if (info->pdata && info->pdata->power_off)
+	if (info->pdata && info->pdata->power_off) {
 		info->pdata->power_off();
+		sensor_opened = false;
+	}
 	file->private_data = NULL;
 	return 0;
 }
@@ -1237,6 +1714,7 @@ static int sensor_probe(struct i2c_client *client,
 			const struct i2c_device_id *id)
 {
 	int err;
+	struct dentry *debugfs_dir;
 
 	pr_info("yuv %s\n",__func__);
 
@@ -1258,6 +1736,14 @@ static int sensor_probe(struct i2c_client *client,
 	info->i2c_client = client;
 
 	i2c_set_clientdata(client, info);
+
+	debugfs_dir = debugfs_create_dir("mi1040", NULL);
+	(void) debugfs_create_file("chip_id", S_IRUGO , debugfs_dir, NULL, &dbg_mi1040_chip_id_fops);
+	(void) debugfs_create_file("get_reg", S_IRUGO | S_IWUSR , debugfs_dir, NULL, &dbg_get_mi1040_reg_fops);
+	(void) debugfs_create_file("set_reg", S_IRUGO | S_IWUSR , debugfs_dir, NULL, &dbg_set_mi1040_reg_fops);
+
+	debugfs_create_x32("val_from_read",0644, debugfs_dir, &g_under_the_table);
+
 	return 0;
 }
 
@@ -1291,8 +1777,13 @@ static struct i2c_driver sensor_i2c_driver = {
 
 static int __init sensor_init(void)
 {
-	pr_info("yuv %s\n",__func__);
-	return i2c_add_driver(&sensor_i2c_driver);
+	int ret;
+
+	printk(KERN_INFO "%s+ #####\n", __func__);
+	ret = i2c_add_driver(&sensor_i2c_driver);
+	printk(KERN_INFO "%s- #####\n", __func__);
+
+	return ret;
 }
 
 static void __exit sensor_exit(void)

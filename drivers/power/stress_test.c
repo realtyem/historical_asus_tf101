@@ -51,10 +51,10 @@ void charger_mode_enable_ic(int enable)
        charge_ic_enable(enable);
 }
 extern int tegra_update_cpu_speed(unsigned long rate);
-extern void PowerOnSeqForChargingMode(void);
-extern void PowerOffSeqForChargingMode(void);
-extern bool is_throttling;
-extern int throttle_index;
+//extern void PowerOnSeqForChargingMode(void);
+//extern void PowerOffSeqForChargingMode(void);
+//extern bool is_throttling;
+//extern int throttle_index;
 #define ventana_pnl_pwr_enb	TEGRA_GPIO_PC6
 #define ventana_lvds_shutdown	TEGRA_GPIO_PB2
 long battery_ioctl(struct file *filp,unsigned int cmd, unsigned long arg)
@@ -64,7 +64,7 @@ long battery_ioctl(struct file *filp,unsigned int cmd, unsigned long arg)
 	if (_IOC_TYPE(cmd) == BATTERY_IOC_MAGIC ){
 	     //printk("  battery_ioctl vaild magic \n");
 		}
-	else	
+	else
 		return -ENOTTY;
 	switch(cmd)
 	{
@@ -83,7 +83,7 @@ long battery_ioctl(struct file *filp,unsigned int cmd, unsigned long arg)
                      //printk(" BATTERY: BATTERY_POWER_KEY (*(int*)arg)=%x\n",(*(int*)arg));
 			break;
 		case BATTERY_START_POLLING:
-			is_throttling=false;
+			//is_throttling=false;
 			tegra_update_cpu_speed(1000000);
 			ready_to_polling=1;
 			exit_charging_mode=1;
@@ -98,8 +98,8 @@ long battery_ioctl(struct file *filp,unsigned int cmd, unsigned long arg)
 			(*(int*)arg)=battery_cable_status;
 	              break;
 		case BATTERY_ENABLE_CHARGER:
-			 is_throttling=true;
-                      throttle_index=1;
+			 //is_throttling=true;
+                      //throttle_index=1;
 			tegra_update_cpu_speed(312000);
 			charger_mode_enable_ic(!!arg);
 			printk(" BATTERY: BATTERY_ENABLE_CHARGER=%lu \n",arg);
@@ -109,18 +109,18 @@ long battery_ioctl(struct file *filp,unsigned int cmd, unsigned long arg)
 			           // gpio_set_value(ventana_pnl_pwr_enb, 1);
 	                         //gpio_set_value(ventana_lvds_shutdown, 1);
 			          //  backlight_enable(1);
-			          PowerOnSeqForChargingMode();
+			          //PowerOnSeqForChargingMode();
 			 }
 			 else{
-			 		//backlight_enable(0);
+					//backlight_enable(0);
 					//gpio_set_value(ventana_pnl_pwr_enb, 0);
 					//gpio_set_value(ventana_lvds_shutdown, 0);
-					PowerOffSeqForChargingMode();
+					//PowerOffSeqForChargingMode();
 			}
 		       // printk(" BATTERY: BATTERY_ENABLE_BACKLIGHT=%lu\n",arg);
 			 break;
                case BATTERY_REBOOT_TEST_TOOL:
-			   	printk(" BATTERY: BATTERY_REBOOT_TEST_TOOL=%lu\n",arg);
+				printk(" BATTERY: BATTERY_REBOOT_TEST_TOOL=%lu\n",arg);
 				 reboot_test_tool_installed=arg;
 				 disable_irq_wake(INT_USB);
 			break;

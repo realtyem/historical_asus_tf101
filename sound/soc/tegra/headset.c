@@ -38,6 +38,7 @@
 #include <mach/board-ventana-misc.h>
 #include <sound/soc.h>
 #include "../codecs/codec_param.h"
+#include "../gpio-names.h"
 
 MODULE_DESCRIPTION("Headset detection driver");
 MODULE_LICENSE("GPL");
@@ -59,16 +60,18 @@ int 			hs_micbias_power(int on);
 /*----------------------------------------------------------------------------
 ** GLOBAL VARIABLES
 **----------------------------------------------------------------------------*/
-#define JACK_GPIO		178	/* TEGRA_GPIO_PW2 */
-#define LINEOUT_GPIO		85		/* TEGRA_GPIO_PK5 */
-#define HOOK_GPIO		185		/* TEGRA_GPIO_PX1 */
+#define JACK_GPIO		(TEGRA_GPIO_PW2) //178
+#define LINEOUT_GPIO	(TEGRA_GPIO_PK5) //85
+#define HOOK_GPIO		(TEGRA_GPIO_PX1) //185
 #define ON	1
 #define OFF	0
 
 enum{
-	NO_DEVICE	= 0,
-	HEADSET	= 2,
+	NO_DEVICE = 0,
+	HEADSET_WITH_MIC = 1,
+	HEADSET_WITHOUT_MIC = 2,
 };
+
 
 struct headset_data {
 	struct switch_dev sdev;
@@ -79,8 +82,8 @@ struct headset_data {
 };
 
 static struct headset_data *hs_data;
-bool jack_alive;
-EXPORT_SYMBOL(jack_alive);
+bool headset_alive = false;
+EXPORT_SYMBOL(headset_alive);
 bool lineout_alive;
 EXPORT_SYMBOL(lineout_alive);
 
@@ -90,8 +93,9 @@ static DECLARE_WORK(g_detection_work, detection_work);
 struct work_struct headset_work;
 struct work_struct lineout_work;
 extern struct snd_soc_codec *global_codec;
+
 extern bool need_spk;
-extern int PRJ_ID;
+
 extern struct wm8903_parameters audio_params[];
 
 static ssize_t headset_name_show(struct switch_dev *sdev, char *buf)
@@ -100,8 +104,11 @@ static ssize_t headset_name_show(struct switch_dev *sdev, char *buf)
 	case NO_DEVICE:{
 		return sprintf(buf, "%s\n", "No Device");
 		}
-	case HEADSET:{
-		return sprintf(buf, "%s\n", "Headset");
+	case HEADSET_WITH_MIC:{
+		return sprintf(buf, "%s\n", "HEADSET");
+		}
+	case HEADSET_WITHOUT_MIC:{
+		return sprintf(buf, "%s\n", "HEADPHONE");
 		}
 	}
 	return -EINVAL;
@@ -112,7 +119,9 @@ static ssize_t headset_state_show(struct switch_dev *sdev, char *buf)
 	switch (switch_get_state(&hs_data->sdev)){
 	case NO_DEVICE:
 		return sprintf(buf, "%d\n", 0);
-	case HEADSET:
+	case HEADSET_WITH_MIC:
+		return sprintf(buf, "%d\n", 1);
+	case HEADSET_WITHOUT_MIC:
 		return sprintf(buf, "%d\n", 2);
 	}
 	return -EINVAL;
@@ -120,48 +129,34 @@ static ssize_t headset_state_show(struct switch_dev *sdev, char *buf)
 
 static void insert_headset(void)
 {
-	snd_soc_write(global_codec, 0x0e, 0x3); /* Enable HP output*/
-	switch_set_state(&hs_data->sdev, HEADSET);
+	if(gpio_get_value(HOOK_GPIO)){
+		printk("%s: headphone\n", __func__);
+		switch_set_state(&hs_data->sdev, HEADSET_WITHOUT_MIC);
+		hs_micbias_power(OFF);
+		headset_alive = false;
+	}else{
+		printk("%s: headset\n", __func__);
+		switch_set_state(&hs_data->sdev, HEADSET_WITH_MIC);
+		hs_micbias_power(ON);
+		headset_alive = true;
+	}
 	hs_data->debouncing_time = ktime_set(0, 20000000);  /* 20 ms */
-	jack_alive = true;
 }
 
 static void remove_headset(void)
 {
-	snd_soc_write(global_codec, 0x0e, 0x0);	/* Disable HP output*/
 	switch_set_state(&hs_data->sdev, NO_DEVICE);
 	hs_data->debouncing_time = ktime_set(0, 100000000);  /* 100 ms */
-	jack_alive = false;
+	headset_alive = false;
 }
-
-int check_hs_type(void)
-{
-	if(jack_alive){
-		hs_micbias_power(0);
-		hs_micbias_power(1);
-	}
-	msleep(100);
-	/* For No Mic dongle */
-	if(!gpio_get_value(JACK_GPIO)){
-		if (gpio_get_value(HOOK_GPIO)){
-			printk("HEADSET: No mic headset\n");
-			return 0;
-		}else{
-			printk("HEADSET: With mic headset\n");
-			return 1;
-		}
-	}else{
-		printk("HEADSET: No headset plug-in\n");
-		return 0;
-	}
-}
-EXPORT_SYMBOL(check_hs_type);
 
 static void detection_work(struct work_struct *work)
 {
 	unsigned long irq_flags;
 	int cable_in1;
+	int mic_in = 0;
 
+	hs_micbias_power(ON);
 	/* Disable headset interrupt while detecting.*/
 	local_irq_save(irq_flags);
 	disable_irq(hs_data->irq);
@@ -177,19 +172,29 @@ static void detection_work(struct work_struct *work)
 
 	if (gpio_get_value(JACK_GPIO) != 0) {
 		/* Headset not plugged in */
-		if (switch_get_state(&hs_data->sdev) == HEADSET)
+		if (switch_get_state(&hs_data->sdev) == HEADSET_WITH_MIC || switch_get_state(&hs_data->sdev) == HEADSET_WITHOUT_MIC)
 			remove_headset();
-		return;
+		goto exit_micbias_off;
 	}
 
 	cable_in1 = gpio_get_value(JACK_GPIO);
-
+	mic_in  = gpio_get_value(HOOK_GPIO);
 	if (cable_in1 == 0) {
+	    printk("HOOK_GPIO value: %d\n", mic_in);
 		if(switch_get_state(&hs_data->sdev) == NO_DEVICE)
 			insert_headset();
+		else if ( mic_in == 1)
+			goto exit_micbias_off;
 	} else{
 		printk("HEADSET: Jack-in GPIO is low, but not a headset \n");
+		goto exit_micbias_off;
 	}
+
+	return;
+
+exit_micbias_off:
+	hs_micbias_power(OFF);
+	return;
 }
 
 static enum hrtimer_restart detect_event_timer_func(struct hrtimer *data)
@@ -207,9 +212,9 @@ static enum hrtimer_restart detect_event_timer_func(struct hrtimer *data)
 static int jack_config_gpio()
 {
 	int ret;
-	
-	printk("HEADSET: Config Jack-in detection gpio\n");
 
+	printk("HEADSET: Config Jack-in detection gpio\n");
+	hs_micbias_power(ON);
 	tegra_gpio_enable(JACK_GPIO);
 	ret = gpio_request(JACK_GPIO, "h2w_detect");
 	ret = gpio_direction_input(JACK_GPIO);
@@ -218,13 +223,14 @@ static int jack_config_gpio()
 	ret = request_irq(hs_data->irq, detect_irq_handler,
 			  IRQF_TRIGGER_FALLING|IRQF_TRIGGER_RISING, "h2w_detect", NULL);
 
-	ret = set_irq_wake(hs_data->irq, 1);
+	ret = irq_set_irq_wake(hs_data->irq, 1);
 
+	msleep(1);
 	if (gpio_get_value(JACK_GPIO) == 0){
-		jack_alive = true;
 		insert_headset();
 	}else {
-		jack_alive = false;
+		hs_micbias_power(OFF);
+		headset_alive = false;
 		remove_headset();
 	}
 
@@ -233,7 +239,7 @@ static int jack_config_gpio()
 
 /**********************************************************
 **  Function: Headset Hook Key Detection interrupt handler
-**  Parameter: irq  
+**  Parameter: irq
 **  Return value: IRQ_HANDLED
 **  High: Hook button pressed
 ************************************************************/
@@ -265,12 +271,12 @@ static void lineout_work_queue(struct work_struct *work)
 		printk("LINEOUT: LineOut removed\n");
 		lineout_alive = false;
 		snd_soc_write(global_codec, 0x10, 0x0003); /* MIXSPK Enable*/
-		if(PRJ_ID == 101){
-		snd_soc_write(global_codec, 0x3E, audio_params[EP101].analog_speaker_volume | 0x80); /* SPKL Volume: 4dB*/
-		snd_soc_write(global_codec, 0x3F, audio_params[EP101].analog_speaker_volume | 0x80); /* SPKR Volume: 4dB*/
-		}else if(PRJ_ID == 102){
-		snd_soc_write(global_codec, 0x3E, audio_params[EP102].analog_speaker_volume | 0x80); /* SPKL Volume: 0dB*/
-		snd_soc_write(global_codec, 0x3F,audio_params[EP102].analog_speaker_volume | 0x80); /* SPKR Volume: 0dB*/
+		if(ASUSGetProjectID() == 101){
+		snd_soc_write(global_codec, 0x3E, audio_params[TF101].analog_speaker_volume | 0x80); /* SPKL Volume: 4dB*/
+		snd_soc_write(global_codec, 0x3F, audio_params[TF101].analog_speaker_volume | 0x80); /* SPKR Volume: 4dB*/
+		}else if(ASUSGetProjectID() == 102){
+		snd_soc_write(global_codec, 0x3E, audio_params[SL101].analog_speaker_volume | 0x80); /* SPKL Volume: 0dB*/
+		snd_soc_write(global_codec, 0x3F,audio_params[SL101].analog_speaker_volume | 0x80); /* SPKR Volume: 0dB*/
 		}
 		snd_soc_write(global_codec, 0x11, 0x0003); /* SPK Enable*/
 		snd_soc_write(global_codec, 0x76, 0x0033); /* GPIO3 configure: EN_SPK*/
@@ -328,7 +334,7 @@ static irqreturn_t detect_irq_handler(int irq, void *dev_id)
 
 	do {
 		value1 = gpio_get_value(JACK_GPIO);
-		set_irq_type(hs_data->irq, value1 ?
+		irq_set_irq_type(hs_data->irq, value1 ?
 				IRQF_TRIGGER_FALLING : IRQF_TRIGGER_RISING);
 		value2 = gpio_get_value(JACK_GPIO);
 	} while (value1 != value2 && retry_limit-- > 0);
@@ -342,7 +348,9 @@ static irqreturn_t detect_irq_handler(int irq, void *dev_id)
 int hs_micbias_power(int on)
 {
 	static int nLastVregStatus = -1;
-	int CtrlReg = 0;
+	unsigned int CtrlReg = 0;
+
+    int ret;
 
 	if(on && nLastVregStatus!=ON){
 		printk("HEADSET: Turn on micbias power\n");
@@ -350,24 +358,23 @@ int hs_micbias_power(int on)
 
 		/* Mic Bias enable */
 		CtrlReg = (0x1<<0) | (0x1<<1);
-		snd_soc_write(global_codec, 0x06, CtrlReg);
-		
+		ret=snd_soc_write(global_codec, 0x06, CtrlReg);
+
 		/* Enable analog inputs */
 		CtrlReg = (0x1<<1) | (0x1<<0);
-		snd_soc_write(global_codec, 0x0C, CtrlReg);
-		
+		ret=snd_soc_write(global_codec, 0x0C, CtrlReg);
+
 	}else if(!on && nLastVregStatus!=OFF){
 		printk("HEADSET: Turn off micbias power\n");
 		nLastVregStatus = OFF;
-		
+
 		/* Mic Bias disable */
 		CtrlReg = (0x0<<0) | (0x0<<1);
-		snd_soc_write(global_codec, 0x06, CtrlReg);
-		
+		ret=snd_soc_write(global_codec, 0x06, CtrlReg);
+
 		/* Disable analog inputs */
 		CtrlReg = (0x0<<1) | (0x0<<0);
-		snd_soc_write(global_codec, 0x0C, CtrlReg);	
-
+		ret=snd_soc_write(global_codec, 0x0C, CtrlReg);
 	}
 	return 0;
 }
@@ -375,19 +382,22 @@ EXPORT_SYMBOL(hs_micbias_power);
 
 /**********************************************************
 **  Function: Headset driver init function
-**  Parameter: none  
+**  Parameter: none
 **  Return value: none
-**                     
+**
 ************************************************************/
 static int __init headset_init(void)
 {
+
 	int ret;
 
-	printk("HEADSET: Headset detection init\n");
+	printk(KERN_INFO "%s+ #####\n", __func__);
 
 	hs_data = kzalloc(sizeof(struct headset_data), GFP_KERNEL);
-	if (!hs_data)
+	if (!hs_data){
+		printk(KERN_INFO "%s- hs_data is NULL !#####\n", __func__);
 		return -ENOMEM;
+	}
 
 	hs_data->debouncing_time = ktime_set(0, 100000000);  /* 100 ms */
 	hs_data->sdev.name = "h2w";
@@ -404,18 +414,19 @@ static int __init headset_init(void)
 	hs_data->timer.function = detect_event_timer_func;
 
 	printk("HEADSET: Headset detection mode\n");
-	jack_config_gpio();/*Config jack detection GPIO*/
 	btn_config_gpio();/*Config hook detection GPIO*/
+	jack_config_gpio();/*Config jack detection GPIO*/
 
+	printk("%s:ProjectID()=%d\n", __FUNCTION__, ASUSGetProjectID());
 	if (ASUSGetProjectID() == 101){
 		INIT_WORK(&lineout_work, lineout_work_queue);
 		lineout_config_gpio();
 	}
-
+	printk(KERN_INFO "%s- #####\n", __func__);
 	return 0;
 
 err_switch_dev_register:
-	printk(KERN_ERR "Headset: Failed to register driver\n");
+	printk(KERN_INFO "%s- Failed to register driver !#####\n", __func__);
 
 	return ret;
 }

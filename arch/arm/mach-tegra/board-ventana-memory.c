@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2010 NVIDIA, Inc.
+ * Copyright (C) 2010-2011 NVIDIA, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -23,7 +23,7 @@
 #include "tegra2_emc.h"
 #include "board.h"
 #include <mach/board-ventana-misc.h>
-static const struct tegra_emc_table ventana_emc_tables_elpida_300Mhz[] =  {
+static const struct tegra_emc_table ventana_emc_tables_elpida_300Mhz[] = {
 	{
 		.rate = 25000,   /* SDRAM frequency */
 		.regs = {
@@ -818,12 +818,16 @@ static const struct tegra_emc_chip ventana_t25_emc_chips[] = {
 		.table_size = ARRAY_SIZE(ventana_emc_tables_elpida_400Mhz)
 	},
 };
+
+static const struct tegra_emc_chip ventana_siblings_emc_chips[] = {
+};
+
 static const struct tegra_emc_chip ASUS_hynix_ventana_emc_chips[] = {
 	{
 		.description = "Hynix 300MHz",
 		.mem_manufacturer_id = 0x0606,
-		.mem_revision_id1 = 0,
-		.mem_revision_id2 = 0,
+		.mem_revision_id1 = -1,
+		.mem_revision_id2 = -1,
 		.mem_pid = 0x5454,
 		.table = ventana_emc_tables_hynix_300Mhz,
 		.table_size = ARRAY_SIZE(ventana_emc_tables_hynix_300Mhz)
@@ -841,7 +845,11 @@ static const struct tegra_emc_chip ASUS_elpida_ventana_emc_chips[] = {
 		.table_size = ARRAY_SIZE(ventana_emc_tables_elpida_300Mhz)
 	},
 };
+
+
 #define TEGRA25_SKU		0x0B00
+#define board_is_ventana(bi) (bi.board_id == 0x24b || bi.board_id == 0x252)
+
 int ventana_emc_init(void)
 {
 	struct board_info BoardInfo;
@@ -868,12 +876,18 @@ int ventana_emc_init(void)
 	}
 	#else
 	tegra_get_board_info(&BoardInfo);
-	if (BoardInfo.sku == TEGRA25_SKU) {
-		tegra_init_emc(ventana_t25_emc_chips,
-			ARRAY_SIZE(ventana_t25_emc_chips));
+
+	if (board_is_ventana(BoardInfo)) {
+		if (BoardInfo.sku == TEGRA25_SKU)
+			tegra_init_emc(ventana_t25_emc_chips,
+				       ARRAY_SIZE(ventana_t25_emc_chips));
+		else
+			tegra_init_emc(ventana_emc_chips,
+				       ARRAY_SIZE(ventana_emc_chips));
 	} else {
-		tegra_init_emc(ventana_emc_chips,
-			ARRAY_SIZE(ventana_emc_chips));
+		pr_info("ventana_emc_init: using ventana_siblings_emc_chips\n");
+		tegra_init_emc(ventana_siblings_emc_chips,
+			       ARRAY_SIZE(ventana_siblings_emc_chips));
 	}
 	#endif
 	return 0;

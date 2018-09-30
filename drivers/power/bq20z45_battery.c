@@ -35,6 +35,7 @@
 #include <mach/gpio.h>
 #include "../../arch/arm/mach-tegra/gpio-names.h"
 #include "../../arch/arm/mach-tegra/wakeups-t2.h"
+#include <linux/delay.h>
 
 #define GPIOPIN_CHARGER_ENABLE                TEGRA_GPIO_PR6
 #define SMBUS_RETRY                                     (3)
@@ -56,13 +57,14 @@ int ready_to_polling=0;
 int ready_to_polling=1;
 #endif
 int reboot_test_tool_installed=0;
+bool check_rvsd_process=0;
 int exit_charging_mode=0;
 EXPORT_SYMBOL(ready_to_polling);
 extern int asusec_is_battery_full_callback(int full);
 extern  int mxt_enable(void);
 extern  int mxt_disable(void);
 enum {
-       REG_MANUFACTURER_DATA,  	
+       REG_MANUFACTURER_DATA,
 	REG_STATE_OF_HEALTH,
 	REG_TEMPERATURE,
 	REG_VOLTAGE,
@@ -73,7 +75,7 @@ enum {
 	REG_CAPACITY,
 	REG_SERIAL_NUMBER,
 	REG_MAX
-};    
+};
 typedef enum {
 	Charger_Type_Battery = 0,
 	Charger_Type_AC,
@@ -131,16 +133,16 @@ static enum power_supply_property bq20z45_properties[] = {
 };
 static int bq20z45_get_fc_bit(int *fc);
 extern unsigned  get_usb_cable_status(void);
-  static void bq20418_charger_control(struct work_struct* work);
-  void charge_ic_enable(bool enable);
-  EXPORT_SYMBOL(charge_ic_enable);
-  int Configure_Charger_pin(void);
+static void bq20418_charger_control(struct work_struct* work);
+void charge_ic_enable(bool enable);
+EXPORT_SYMBOL(charge_ic_enable);
+int Configure_Charger_pin(void);
 int bq20z45_check_alarm(int battery_status);
-
+int  check_rvsd(void);
 #define USB_NO_Cable 0
-#define USB_DETECT_CABLE 1 
+#define USB_DETECT_CABLE 1
 #define USB_SHIFT 0
-#define AC_SHIFT 1 
+#define AC_SHIFT 1
 #define USB_Cable ((1 << (USB_SHIFT)) | (USB_DETECT_CABLE))
 #define USB_AC_Adapter ((1 << (AC_SHIFT)) | (USB_DETECT_CABLE))
 #define USB_CALBE_DETECT_MASK (USB_Cable  | USB_DETECT_CABLE)
@@ -157,22 +159,26 @@ static int pseudo_suspend_charging_on=0 ;
 void check_cabe_type(void)
 {
       if(battery_cable_status == USB_AC_Adapter){
-		 ac_on = 1 ;
-	        usb_on = 0;
+		ac_on = 1;
+		usb_on = 0;
 	}
 	else if(battery_cable_status  == USB_Cable){
 		usb_on = 1;
+		/*
 		 if(battery_docking_status)
 			ac_on = 1;
 		 else
-			ac_on = 0;
+		 */
+		ac_on = 0;
 	}
+	/*
 	else if(battery_docking_status){
 		 ac_on = 1 ;
 	        usb_on = 0;
 	}
+	*/
 	else{
-		ac_on = 0 ;
+		ac_on = 0;
 		usb_on = 0;
 	}
 }
@@ -192,12 +198,14 @@ static int power_get_property(struct power_supply *psy,
 	switch (psp) {
 
 	case POWER_SUPPLY_PROP_ONLINE:
-		   if(psy->type == POWER_SUPPLY_TYPE_MAINS &&  ac_on )
-		   	val->intval =  1;
-		   else if (psy->type == POWER_SUPPLY_TYPE_USB && usb_on)
-		   val->intval =  1;
-		   else 
-		   	val->intval = 0;
+			if(psy->type == POWER_SUPPLY_TYPE_MAINS &&  ac_on )
+				val->intval = 1;
+			else if (psy->type == POWER_SUPPLY_TYPE_USB && usb_on)
+				val->intval = 1;
+			else if (psy->type == POWER_SUPPLY_TYPE_DOCK_AC&& battery_docking_status)
+				val->intval = 1;
+			else
+				val->intval = 0;
 		break;
 
 	default:
@@ -242,6 +250,13 @@ static struct power_supply bq20z45_supply[] = {
 		.get_property =power_get_property,
 	},
 #endif
+	{
+		.name                    = "docking_ac",
+		.type                      = POWER_SUPPLY_TYPE_DOCK_AC,
+		.properties =power_properties,
+		.num_properties = ARRAY_SIZE(power_properties),
+		.get_property =power_get_property,
+	},
 };
 
 static struct bq20z45_device_info {
@@ -275,31 +290,31 @@ static struct bq20z45_device_info {
 int bq20z45_smbus_read_data(int reg_offset,int byte)
 {
      s32 ret=-EINVAL;
-     int count=0; 
-     do{
-	    if(byte)
-              ret=i2c_smbus_read_byte_data(bq20z45_device->client,bq20z45_data[reg_offset].addr);
-	    else
-	    ret=i2c_smbus_read_word_data(bq20z45_device->client,bq20z45_data[reg_offset].addr);
+     int count=0;
+	do{
+		if(byte)
+			ret=i2c_smbus_read_byte_data(bq20z45_device->client,bq20z45_data[reg_offset].addr);
+		else
+			ret=i2c_smbus_read_word_data(bq20z45_device->client,bq20z45_data[reg_offset].addr);
 
-     	}while((ret<0)&& (++count<=SMBUS_RETRY));
+	}while((ret<0)&& (++count<=SMBUS_RETRY));
       return ret;
 }
 
 int bq20z45_smbus_write_data(int reg_offset,int byte, unsigned int value)
 {
      s32 ret=-EINVAL;
-     int count=0; 
+     int count=0;
 
      do{
 	    if(byte){
                   ret=i2c_smbus_write_byte_data(bq20z45_device->client,bq20z45_data[reg_offset].addr,value&0xFF);
-	    	}
+	}
 	    else{
 	          ret=i2c_smbus_write_word_data(bq20z45_device->client,bq20z45_data[reg_offset].addr,value&0xFFFF);
-	    	}
+		}
 
-     	}while((ret<0)&& (++count<=SMBUS_RETRY));
+	}while((ret<0)&& (++count<=SMBUS_RETRY));
       return ret;
 }
 struct workqueue_struct *battery_work_queue=NULL;
@@ -325,7 +340,7 @@ static void battery_status_poll(struct work_struct *work)
 	  //printk("battery_status_poll\n");
 	//kobject_uevent(&bq20z45_supply.dev->kobj, KOBJ_CHANGE);
 	power_supply_changed(&bq20z45_supply[Charger_Type_Battery]);
-	
+
 	/* Schedule next poll */
        bq20z45_device->battery_present =!(gpio_get_value(bq20z45_device->gpio_battery_detect));
 	if(ready_to_polling &&  bq20z45_device->battery_present)
@@ -355,7 +370,7 @@ static irqreturn_t low_battery_detect_isr(int irq, void *dev_id)
 void setup_detect_irq(void )
 {
        s32 ret=0;
-	   
+
        bq20z45_device->gpio_battery_detect=GPIOPIN_BATTERY_DETECT;
 	bq20z45_device->gpio_low_battery_detect=GPIOPIN_LOW_BATTERY_DETECT;
 	 bq20z45_device->battery_present=0;
@@ -367,7 +382,7 @@ void setup_detect_irq(void )
 		bq20z45_device->gpio_battery_detect = -1;
 		goto setup_low_bat_irq;
 	}
-	
+
 	bq20z45_device->irq_battery_detect = gpio_to_irq(bq20z45_device->gpio_battery_detect);
 	if (bq20z45_device->irq_battery_detect < 0) {
 		printk("invalid battery_detect GPIO\n");
@@ -383,7 +398,7 @@ void setup_detect_irq(void )
 			bq20z45_device->gpio_battery_detect= -1;
 			goto setup_low_bat_irq;
 	}
-	
+
 
 	ret = request_irq(bq20z45_device->irq_battery_detect , battery_detect_isr,
 			IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,"bq20z45-battery (detect)", NULL);
@@ -393,14 +408,14 @@ void setup_detect_irq(void )
 	 bq20z45_device->battery_present=!(gpio_get_value(bq20z45_device->gpio_battery_detect));
 	printk("setup_irq: battery_present =%x   \n",bq20z45_device->battery_present);
  setup_low_bat_irq:
- 	 tegra_gpio_enable(bq20z45_device->gpio_low_battery_detect);
+	 tegra_gpio_enable(bq20z45_device->gpio_low_battery_detect);
        ret = gpio_request(bq20z45_device->gpio_low_battery_detect, "low_battery_detect");
 	if (ret < 0) {
 		printk("request low_battery_detect gpio failed\n");
 		bq20z45_device->gpio_low_battery_detect = -1;
 		goto exit;
 	}
-	
+
 	bq20z45_device->irq_low_battery_detect = gpio_to_irq(bq20z45_device->gpio_low_battery_detect);
 	if (bq20z45_device->irq_low_battery_detect< 0) {
 		printk("invalid low_battery_detect gpio\n");
@@ -408,7 +423,7 @@ void setup_detect_irq(void )
 		bq20z45_device->irq_low_battery_detect = -1;
 		goto exit;
 	}
-	
+
 	ret = gpio_direction_input(bq20z45_device->gpio_low_battery_detect);
 	if (ret < 0) {
 			printk("failed to configure low_battery_detect  gpio\n");
@@ -422,9 +437,10 @@ void setup_detect_irq(void )
 	if (ret < 0) {
             printk("failed to request  low)battery_detect irq\n");
 	}
+	enable_irq_wake(bq20z45_device->irq_low_battery_detect);
 printk("setup_irq:low_battery_present=%x \n",bq20z45_device->low_battery_present);
 exit:
- 	
+
 	return;
 }
 
@@ -457,67 +473,69 @@ static void charger_pad_dock_detection(struct work_struct *w)
 static int bq20z45_get_health(enum power_supply_property psp,
 	union power_supply_propval *val)
 {
-	s32 ret;	/* Write to ManufacturerAccess with	 
-	* ManufacturerAccess command and then	 
-	* read the status */	
-	
+	s32 ret;	/* Write to ManufacturerAccess with
+	* ManufacturerAccess command and then
+	* read the status */
+
 	/*ret = i2c_smbus_write_word_data(bq20z45_device->client,
 	bq20z45_data[REG_MANUFACTURER_DATA].addr,
 	MANUFACTURER_ACCESS_STATUS);*/
 	ret =bq20z45_smbus_write_data(REG_MANUFACTURER_DATA,0,MANUFACTURER_ACCESS_STATUS);
-	if (ret < 0) {		
-		dev_err(&bq20z45_device->client->dev,"%s: i2c write for battery presence "		
-			"failed\n", __func__);		
-		return -EINVAL;	
-		}	
+	if (ret < 0) {
+		dev_err(&bq20z45_device->client->dev,"%s: i2c write for battery presence "
+			"failed\n", __func__);
+		return -EINVAL;
+		}
 	/*ret = i2c_smbus_read_word_data(bq20z45_device->client,bq20z45_data[REG_MANUFACTURER_DATA].addr);*/
 	ret=bq20z45_smbus_read_data(REG_MANUFACTURER_DATA,0);
-	
-	if (ret < 0) {		
-		     dev_err(&bq20z45_device->client->dev,"%s: i2c read for battery presence "			
-			"failed\n", __func__);		
-		     return -EINVAL;	
-		}	
-	
-	if (ret >= bq20z45_data[REG_MANUFACTURER_DATA].min_value && ret <= bq20z45_data[REG_MANUFACTURER_DATA].max_value) {		
-		/* Mask the upper nibble of 2nd byte and		 
-		* lower byte of response then		 
-		* shift the result by 8 to get status*/		
-		ret &= 0x0F00;		
-		ret >>= 8;		
-		if (psp == POWER_SUPPLY_PROP_PRESENT) {		
+
+	if (ret < 0) {
+		     dev_err(&bq20z45_device->client->dev,"%s: i2c read for battery presence "
+			"failed\n", __func__);
+		     return -EINVAL;
+		}
+
+	if (ret >= bq20z45_data[REG_MANUFACTURER_DATA].min_value && ret <= bq20z45_data[REG_MANUFACTURER_DATA].max_value) {
+		/* Mask the upper nibble of 2nd byte and
+		* lower byte of response then
+		* shift the result by 8 to get status*/
+		ret &= 0x0F00;
+		ret >>= 8;
+		if (psp == POWER_SUPPLY_PROP_PRESENT) {
 			static char *present_text[] = {"Removed","Exist"};
-			if (ret == 0x0F)				/* battery removed */			
-				val->intval = 0;			
-			else				
-				val->intval = 1;	
+			if (ret == 0x0F)				/* battery removed */
+				val->intval = 0;
+			else
+				val->intval = 1;
 			// printk("bq20z45_get_psp POWER_SUPPLY_PROP_PRESENT  %s\n",present_text[val->intval]);
-		}		
-		else if (psp == POWER_SUPPLY_PROP_HEALTH) {	
+		}
+		else if (psp == POWER_SUPPLY_PROP_HEALTH) {
 			static char *health_text[] = {"Unknown", "Good", "Overheat", "Dead", "Over voltage","Unspecified failure", "Cold"};
-			if (ret == 0x09)				
-				val->intval = POWER_SUPPLY_HEALTH_UNSPEC_FAILURE;			
-			else if (ret == 0x0B)				
-				val->intval = POWER_SUPPLY_HEALTH_OVERHEAT;		
-			else if (ret == 0x0C)				
-				val->intval = POWER_SUPPLY_HEALTH_DEAD;			
-			else	
+			if (ret == 0x09)
+				val->intval = POWER_SUPPLY_HEALTH_UNSPEC_FAILURE;
+			else if (ret == 0x0B)
+				val->intval = POWER_SUPPLY_HEALTH_OVERHEAT;
+			else if (ret == 0x0C)
+				val->intval = POWER_SUPPLY_HEALTH_DEAD;
+			else
 				val->intval = POWER_SUPPLY_HEALTH_GOOD;	
 			// printk("bq20z45_get_psp POWER_SUPPLY_PROP_HEALTH %s\n",health_text[val->intval]);
-		}	
-	
-		} else {		
-		        val->intval = 0;	
-		}	
+		}
+
+		} else {
+		        val->intval = 0;
+		}
 	return 0;
-	
+
 }
 static int bq20z45_get_chargingCurrent(void)
 {
 	s32 ret,count=0;
-       #define REG_CHARGING_CURRENT (0x14)
-       do{
-	    ret=i2c_smbus_read_word_data(bq20z45_device->client,REG_CHARGING_CURRENT);
+ 	#define REG_CHARGING_CURRENT (0x14)
+	if(check_rvsd_process)
+		return 0xF;
+	do{
+		ret=i2c_smbus_read_word_data(bq20z45_device->client,REG_CHARGING_CURRENT);
 	}while((ret<0)&& (++count<=SMBUS_RETRY));
 
 	if (ret < 0) {
@@ -536,6 +554,8 @@ static int bq20z45_get_chargingVoltage(void)
 {
        s32 ret=0,count=0;
        #define REG_CHARGING_VOLTAGE (0x15)
+	if(check_rvsd_process)
+		return 0xF;
        do{
 	    ret=i2c_smbus_read_word_data(bq20z45_device->client,REG_CHARGING_VOLTAGE);
 	}while((ret<0)&& (++count<=SMBUS_RETRY));
@@ -561,7 +581,7 @@ static int bq20z45_get_psp(int reg_offset, enum power_supply_property psp,
 	if (ret < 0) {
 		dev_err(&bq20z45_device->client->dev,
 			"%s: i2c read for %d failed\n", __func__, reg_offset);
-		
+
 		if(psp == POWER_SUPPLY_PROP_TEMP && (++bq20z45_device->temp_err<=3) &&(bq20z45_device->old_temperature!=0xFF)){
 			val->intval=bq20z45_device->old_temperature;
 			printk("read battery's tempurate fail use old temperature=%u bq20z45_device->temp_err=%u\n",val->intval,bq20z45_device->temp_err);
@@ -581,14 +601,14 @@ static int bq20z45_get_psp(int reg_offset, enum power_supply_property psp,
 			/* mask the upper byte and then find the
 			 * actual status */
                    static char *status_text[] = {"Unknown", "Charging", "Discharging", "Not charging", "Full"};
-                    
+
 			if (!(ret & BATTERY_CHARGING) && (ac_on ||battery_docking_status))//DSG
 				val->intval = POWER_SUPPLY_STATUS_CHARGING;
 			else if (ret & BATTERY_FULL_CHARGED)//fc
 				val->intval = POWER_SUPPLY_STATUS_FULL;
 			else if (ret & BATTERY_FULL_DISCHARGED)//fd
 				val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
-			else 
+			else
 				val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
 
 				if(ac_on  || battery_docking_status || ( pseudo_suspend_charging_on &&usb_on )){
@@ -613,8 +633,8 @@ static int bq20z45_get_psp(int reg_offset, enum power_supply_property psp,
 			val->intval = POWER_SUPPLY_STATUS_UNKNOWN;
 			printk("Error:bq20z45_get_psp POWER_SUPPLY_STATUS_UNKNOWN ret=%x  addr=%x %x %x %x\n",ret,bq20z45_data[reg_offset].addr,reg_offset,bq20z45_data[reg_offset].min_value,bq20z45_data[reg_offset].max_value);
 		}
-			     
-		}
+
+	}
 
 	return 0;
 }
@@ -702,12 +722,12 @@ static int bq20z45_get_property(struct power_supply *psy,
 				"%s: INVALID property psp=%u\n", __func__,psp);
 			return -EINVAL;
 	}
-  
+
 	return 0;
 
 	error:
-		
-	return -EINVAL;	
+
+	return -EINVAL;
 }
 
 #include "stress_test.c"
@@ -720,7 +740,7 @@ void docking_callback(void )
 		battery_docking_status=true;
 		enable_irq(gpio_to_irq(TEGRA_GPIO_PS1));
 	}else{
-	  	battery_docking_status=false;
+		battery_docking_status=false;
 		disable_irq(gpio_to_irq(TEGRA_GPIO_PS1));
 	}
 
@@ -741,14 +761,14 @@ void   register_docking_charging_irq(void)
 	rc= gpio_direction_input(TEGRA_GPIO_PS1);
 	if (rc)
 	        printk(KERN_ERR"gpio_direction_input failed for input TEGRA_GPIO_PS1=%d\n", TEGRA_GPIO_PS1);
-	 rc= request_irq(gpio_to_irq(TEGRA_GPIO_PS1), charger_pad_dock_interrupt, IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING, "dock_charging" , NULL);
+	rc= request_irq(gpio_to_irq(TEGRA_GPIO_PS1), charger_pad_dock_interrupt, IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING, "dock_charging" , NULL);
 	if (rc < 0)
-	        printk(KERN_ERR"Could not register for TEGRA_GPIO_PS1 interrupt, irq = %d, rc = %d\n", gpio_to_irq(TEGRA_GPIO_PS1), rc);
+		printk(KERN_ERR"Could not register for TEGRA_GPIO_PS1 interrupt, irq = %d, rc = %d\n", gpio_to_irq(TEGRA_GPIO_PS1), rc);
 
-        if(!gpio_get_value(TEGRA_GPIO_PX5) && !gpio_get_value(TEGRA_GPIO_PS1)){
-			battery_docking_status=true;
-			enable_irq(gpio_to_irq(TEGRA_GPIO_PS1));
-        }else
+	if(!gpio_get_value(TEGRA_GPIO_PX5) && !gpio_get_value(TEGRA_GPIO_PS1)){
+		battery_docking_status=true;
+		enable_irq(gpio_to_irq(TEGRA_GPIO_PS1));
+	}else
 		disable_irq(gpio_to_irq(TEGRA_GPIO_PS1));
 	printk(" register_docking_charging_irq  px5=%x ps1=%x \n",gpio_get_value(TEGRA_GPIO_PX5),gpio_get_value(TEGRA_GPIO_PS1) );
 }
@@ -762,6 +782,87 @@ void  setup_5v_chg_en_pin(void)
 	tegra_gpio_enable(TEGRA_GPIO_PS5);
 }
 extern unsigned int ASUSGetProjectID( void );
+#define VALUE_ARRY_SIZE (7)
+unsigned short value[VALUE_ARRY_SIZE]={0};
+
+void set_value(unsigned short buffer[])
+{
+	int i=0,ret=0;
+	printk("bq20z45 set_value\n");
+	while(i < (VALUE_ARRY_SIZE-1)){
+		value[i]=buffer[i];
+		i++;
+	}
+	value[VALUE_ARRY_SIZE-1]=0xFF;
+	i=0;
+	do{
+		ret=check_rvsd();
+	}while(ret && ++i<=3);
+}
+EXPORT_SYMBOL(set_value);
+int  check_rvsd(void)
+{
+	#define	PF_STATUS_REGISTER	(0x53)
+	#define	RSVD_BIT	(1<<14)
+	unsigned short PF_Status=0;
+	int ret=0;
+
+	check_rvsd_process=1;
+	if (value[VALUE_ARRY_SIZE-1]!=0xFF){
+		printk("check_rvsd value not ready\n");
+		return ret;
+	}
+	printk("check_rvsd  %x %x %x %x %x \n",value[0],value[1],value[2],value[3],value[4],value[5]);
+
+	ret=i2c_smbus_write_word_data(bq20z45_device->client,0x0,value[0]);
+	if(ret <0){
+		printk("check_rvsd write fail 0\n");
+		return ret;
+	}
+
+	ret=i2c_smbus_write_word_data(bq20z45_device->client,0x0,value[1]);
+	if(ret <0){
+		printk("check_rvsd write  fail 1\n");
+		return ret;
+	}
+
+	PF_Status=i2c_smbus_read_word_data(bq20z45_device->client,PF_STATUS_REGISTER);
+	if(ret <0){
+		printk("check_rvsd read PF_STATUS_REGISTER fail\n");
+		return ret;
+	}
+
+	//check PF status
+	if(PF_Status == RSVD_BIT && ac_on ){
+		// clear PF status
+		charge_ic_enable(true);
+		msleep(5000);
+		ret=i2c_smbus_write_word_data(bq20z45_device->client,0x0,value[2]);
+		if(ret <0){
+			printk("check_rvsd write  fail 2\n");
+			return ret;
+		}
+
+		ret=i2c_smbus_write_word_data(bq20z45_device->client,0x0,value[3]);
+		if(ret <0){
+			printk("check_rvsd write  fail 3\n");
+			return ret;
+		}
+
+		ret=i2c_smbus_write_word_data(bq20z45_device->client,0x0,value[4]);
+		if(ret <0){
+			printk("check_rvsd write  fail 4\n");
+			return ret;
+		}
+	}
+
+	ret=i2c_smbus_write_word_data(bq20z45_device->client,0x0,value[5]);
+	if(ret <0)
+		printk("check_rvsd write  fail 5\n");
+
+	check_rvsd_process=0;
+	return ret;
+}
 static int bq20z45_probe(struct i2c_client *client,
 	const struct i2c_device_id *id)
 {
@@ -821,19 +922,19 @@ static int bq20z45_probe(struct i2c_client *client,
 	 register_docking_charging_irq();
 
 	battery_cable_status = get_usb_cable_status();
-       /*if(battery_cable_status==USB_AC_Adapter || battery_docking_status ){
+	/*if(battery_cable_status==USB_AC_Adapter || battery_docking_status ){
 		 cancel_delayed_work(&bq20z45_device->status_poll_work);
 		 cancel_delayed_work(&bq20z45_device->charger_control);
 		 bq20418_charger_control(NULL);
-         	}
+		}
 	 else{
-	 	  charge_ic_enable(false);
-		  cancel_delayed_work(&bq20z45_device->status_poll_work);
-		  cancel_delayed_work(&bq20z45_device->charger_control);
+			charge_ic_enable(false);
+			cancel_delayed_work(&bq20z45_device->status_poll_work);
+			cancel_delayed_work(&bq20z45_device->charger_control);
 		  #ifndef CONFIG_ASUS_CHARGER_MODE
-	 	  queue_delayed_work(battery_work_queue,&bq20z45_device->status_poll_work,5*HZ);
+			queue_delayed_work(battery_work_queue,&bq20z45_device->status_poll_work,5*HZ);
 		  #endif
-	 	}*/
+		}*/
 	 cancel_delayed_work(&bq20z45_device->status_poll_work);
 	 cancel_delayed_work(&bq20z45_device->charger_control);
 	 bq20418_charger_control(NULL);
@@ -856,7 +957,7 @@ static int bq20z45_remove(struct i2c_client *client)
 	struct bq20z45_device_info *bq20z45_device;
        int i=0;
 	bq20z45_device = i2c_get_clientdata(client);
-	
+
 	for (i = 0; i < ARRAY_SIZE(bq20z45_supply); i++) {
 		power_supply_unregister(&bq20z45_supply[i]);
 	}
@@ -884,13 +985,13 @@ static int bq20z45_suspend(struct i2c_client *client,
 		bq20z45_data[REG_MANUFACTURER_DATA].addr,
 		MANUFACTURER_ACCESS_SLEEP);
 	if(bq20z45_device->battery_present ){
-        	ret=bq20z45_smbus_write_data(REG_MANUFACTURER_DATA,0,MANUFACTURER_ACCESS_SLEEP);
-        	if (ret < 0 ) {
-        		dev_err(&bq20z45_device->client->dev,
-                			"%s: i2c write for %d failed\n",
-                			__func__, MANUFACTURER_ACCESS_SLEEP);
-        		return -EINVAL;
-        	}
+		ret=bq20z45_smbus_write_data(REG_MANUFACTURER_DATA,0,MANUFACTURER_ACCESS_SLEEP);
+		if (ret < 0 ) {
+		dev_err(&bq20z45_device->client->dev,
+			"%s: i2c write for %d failed\n",
+				__func__, MANUFACTURER_ACCESS_SLEEP);
+			return -EINVAL;
+		}
 	}else{
 	printk("bq20z45_suspend: no battery");
 	}
@@ -905,15 +1006,15 @@ static int bq20z45_resume(struct i2c_client *client)
 {
       #define LOW_BATTERY_WAKESOURCE_PAD TEGRA_WAKE_GPIO_PW3
 
-      bq20z45_device->battery_present =!(gpio_get_value(bq20z45_device->gpio_battery_detect));
-      cancel_delayed_work(&bq20z45_device->status_poll_work);
-      if(!gpio_get_value(TEGRA_GPIO_PX5) && !gpio_get_value(TEGRA_GPIO_PS1)){
-	  battery_docking_status=true;
+	bq20z45_device->battery_present =!(gpio_get_value(bq20z45_device->gpio_battery_detect));
+	cancel_delayed_work(&bq20z45_device->status_poll_work);
+	if(!gpio_get_value(TEGRA_GPIO_PX5) && !gpio_get_value(TEGRA_GPIO_PS1)){
+		battery_docking_status=true;
 		enable_irq(gpio_to_irq(TEGRA_GPIO_PS1));
 	}else{
 		battery_docking_status=false;
 		disable_irq(gpio_to_irq(TEGRA_GPIO_PS1));
-	 }
+	}
 
 	if(temp_wake_status&TEGRA_WAKE_USB1_VBUS){
 		temp_wake_status&=(~TEGRA_WAKE_USB1_VBUS);
@@ -922,20 +1023,21 @@ static int bq20z45_resume(struct i2c_client *client)
 		if ( ac_on )
 			power_supply_changed(&bq20z45_supply[Charger_Type_AC]);
 		#ifndef REMOVE_USB_POWER_SUPPLY
-		 if ( usb_on )
+		if ( usb_on )
 			power_supply_changed(&bq20z45_supply[Charger_Type_USB]);
 		#endif
 	}
 
 	if(ready_to_polling){
 		if(wake_status&LOW_BATTERY_WAKESOURCE_PAD){
-                 queue_delayed_work(battery_work_queue,&bq20z45_device->status_poll_work,3*HZ);
-		   wake_lock_timeout(&bq20z45_device->low_battery_wake_lock, 6*HZ);
+			queue_delayed_work(battery_work_queue,&bq20z45_device->status_poll_work,3*HZ);
+			wake_lock_timeout(&bq20z45_device->low_battery_wake_lock, 6*HZ);
 		}
 		else
-                 queue_delayed_work(battery_work_queue,&bq20z45_device->status_poll_work,5*HZ);
-	   }
-	  printk("bq20z45_resume wake_status= %x", wake_status);
+			queue_delayed_work(battery_work_queue,&bq20z45_device->status_poll_work,5*HZ);
+	}
+	printk("bq20z45_resume wake_status= %x", wake_status);
+
 	return 0;
 }
 #endif
@@ -961,23 +1063,23 @@ static struct i2c_driver bq20z45_battery_driver = {
  //#ifdef  SUPPORT_CHARGE_CONTROL
 int bq20z45_check_alarm(int battery_status)
 {
-       #define BATTERY_STATUS_TCA                 (1<<14)
-       #define BATTERY_STATUS_OTA                 (1<<12)
-	 if( battery_status & BATTERY_STATUS_TCA ){
-	 	printk("bq20z45_check_alarm BATTERY_STATUS_TCA,Terminate Charge Alarm\n");//4
-	 	return 1;
-	 }
-	  if( battery_status & BATTERY_STATUS_OTA  ){
-	  	printk("bq20z45_check_alarm BATTERY_STATUS_OTA, Over Temperature Alarm \n");
-	 	return 1;
-	 }
+	#define BATTERY_STATUS_TCA			(1<<14)
+	#define BATTERY_STATUS_OTA			(1<<12)
+	if( battery_status & BATTERY_STATUS_TCA ){
+		printk("bq20z45_check_alarm BATTERY_STATUS_TCA,Terminate Charge Alarm\n");//4
+		return 1;
+	}
+	if( battery_status & BATTERY_STATUS_OTA  ){
+		printk("bq20z45_check_alarm BATTERY_STATUS_OTA, Over Temperature Alarm \n");
+		return 1;
+	}
 	return 0;
 }
 static int bq20z45_get_fc_bit(int *fc)
 {
 	s32 ret;
-	#define BATTERY_STATUS_FC                  (1<<5)
-					  
+	#define BATTERY_STATUS_FC				(1<<5)
+
 	/*ret = i2c_smbus_read_word_data(bq20z45_device->client,
 		bq20z45_data[REG_STATUS].addr);*/
 	ret=bq20z45_smbus_read_data(REG_STATUS,0);
@@ -986,26 +1088,25 @@ static int bq20z45_get_fc_bit(int *fc)
 			"%s: i2c read for %d failed\n", __func__, REG_STATUS);
 		return -EINVAL;
 	}
-			
+
 	if (ret >= bq20z45_data[REG_STATUS].min_value &&
-	    ret <= bq20z45_data[REG_STATUS].max_value) {
-                     *fc= ret&BATTERY_STATUS_FC;
-                       printk("bq20z45_get_fc_bit fc=%x\n",*fc);//4
-		}
+		ret <= bq20z45_data[REG_STATUS].max_value) {
+			*fc= ret&BATTERY_STATUS_FC;
+			printk("bq20z45_get_fc_bit fc=%x\n",*fc);//4
+	}
 
 	return ret;
 }
 
 int Configure_Charger_pin(void)
 {
-      int ret=0;
-   
-       ret = gpio_request(GPIOPIN_CHARGER_ENABLE, "charger_enable");
+	int ret=0;
+
+	ret = gpio_request(GPIOPIN_CHARGER_ENABLE, "charger_enable");
 	if (ret < 0) {
 		printk("request charger_enable gpio failed\n");
 		goto Cleanup;
 	}
-	
 
 	ret = gpio_direction_output(GPIOPIN_CHARGER_ENABLE,1/*default disable*/);
 	if (ret < 0) {
@@ -1013,25 +1114,26 @@ int Configure_Charger_pin(void)
 			gpio_free(GPIOPIN_CHARGER_ENABLE);
 			goto Cleanup;
 	}
-	   tegra_gpio_enable(GPIOPIN_CHARGER_ENABLE);
-    return 1;
+	tegra_gpio_enable(GPIOPIN_CHARGER_ENABLE);
+
+	return 1;
 Cleanup:
     return 0;
 }
 void charge_ic_enable(bool enable)
 {
-   int output_high=0;
-    static int old_state=0xFF;
-    int new_state=0xFF;
+	int output_high=0;
+	static int old_state=0xFF;
+	int new_state=0xFF;
 
-    if(enable ){
-            output_high=false;
-	      new_state=CHARGER_STATE_ENABLED;
-    	}
-    else{
-    	     output_high=true;
-	     new_state=CHARGER_STATE_DISABLED;
-    	}
+	if(enable ){
+		output_high=false;
+		new_state=CHARGER_STATE_ENABLED;
+	}
+	else{
+		output_high=true;
+		new_state=CHARGER_STATE_DISABLED;
+	}
     if ( (enable) && (old_state!=new_state) )
 		asusec_is_battery_full_callback(false);
     // printk("charge_ic_enable  enable=%x battery_cable_status =%u new_state=%x 0ld_state=%x output_high=%s\n",enable,battery_cable_status ,new_state,old_state,output_high?"HIGH":"LOW");
@@ -1047,15 +1149,15 @@ void charge_ic_enable(bool enable)
 unsigned int  get_charge_ic_state(void )
 {
 
-   int  state=gpio_get_value(GPIOPIN_CHARGER_ENABLE);
-   return (unsigned int)!state;
+	int  state=gpio_get_value(GPIOPIN_CHARGER_ENABLE);
+	return (unsigned int)!state;
 }
 static void bq20418_charger_control(struct work_struct* work)
 {
-      int fc=1;
-      int baytery_status=0;
-	
-       check_cabe_type();
+	int fc=1;
+	int baytery_status=0;
+
+	check_cabe_type();
 	if( ready_to_polling ){
 		if(ac_on ||( pseudo_suspend_charging_on && usb_on )/*||usb_on*/){
 			baytery_status=bq20z45_get_fc_bit(&fc);
@@ -1086,19 +1188,19 @@ static void bq20418_charger_control(struct work_struct* work)
  * 0111: Car Mount+AC apdater
  * 1XXX: Car Mount has power
  * 0XXX: Car mount does not have power
- */ 
+ */
 
 void battery_callback(unsigned usb_cable_state)
 {
-      int old_cable_status=battery_cable_status;
-       printk("========================================================\n") ;
+	int old_cable_status=battery_cable_status;
+	printk("========================================================\n") ;
 	printk("battery_callback  usb_cable_state =%x\n",usb_cable_state ) ;
-       printk("========================================================\n") ;
-      battery_cable_status = usb_cable_state ;
+	printk("========================================================\n") ;
+	battery_cable_status = usb_cable_state;
 	if(!battery_driver_ready)
 		return;
 
-       wake_lock_timeout(&bq20z45_device->cable_event_wake_lock, 2*HZ);
+	wake_lock_timeout(&bq20z45_device->cable_event_wake_lock, 2*HZ);
 	if(! battery_cable_status){
 		if ( old_cable_status == USB_AC_Adapter){
 			power_supply_changed(&bq20z45_supply[Charger_Type_AC]);
@@ -1118,18 +1220,18 @@ void battery_callback(unsigned usb_cable_state)
 		 cancel_delayed_work(&bq20z45_device->status_poll_work);
 		 cancel_delayed_work(&bq20z45_device->charger_control);
 		 queue_delayed_work(battery_work_queue,&bq20z45_device->charger_control,0);
-         	}
-	 
+	}
+
 }
 EXPORT_SYMBOL(battery_callback);
 void pseudo_suspend_charging_mode_en(int enable)
 {
-       printk("en_pseudo_suspend_charging_mode enable=%u usb_on=%u\n", enable,usb_on);
-       if(  enable && usb_on)
+	printk("en_pseudo_suspend_charging_mode enable=%u usb_on=%u\n", enable,usb_on);
+	if(  enable && usb_on)
 		gpio_set_value(TEGRA_GPIO_PS5, LIMIT_IC_EN);
-	   else
+	else
 		gpio_set_value(TEGRA_GPIO_PS5, LIMIT_IC_DIS);
-       charge_ic_enable(enable);
+	charge_ic_enable(enable);
 }
 int battery_charger_callback(unsigned int enable)
 {
@@ -1141,7 +1243,7 @@ int battery_charger_callback(unsigned int enable)
 		pseudo_suspend_charging_on=true;
 		pseudo_suspend_charging_mode_en(true);
     }else{
-    	       pseudo_suspend_charging_on=false;
+		pseudo_suspend_charging_on=false;
 		pseudo_suspend_charging_mode_en(false);
     }
     return 0;

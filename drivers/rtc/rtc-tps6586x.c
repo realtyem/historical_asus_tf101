@@ -40,6 +40,8 @@
 #define RTC_ALARM1_HI	0xc1
 #define RTC_COUNT4	0xc6
 #define RTC_COUNT4_DUMMYREAD 0xc5  /* start a PMU RTC access by reading the register prior to the RTC_COUNT4 */
+#define ALM1_VALID_RANGE_IN_SEC 0x3FFF /*only 14-bits width in second*/
+struct tps6586x_rtc  *ptps6586x_rtc_dev;
 
 struct tps6586x_rtc {
 	unsigned long		epoch_start;
@@ -48,6 +50,73 @@ struct tps6586x_rtc {
 	bool			irq_en;
 };
 
+static int tps6586x_rtc_read_time(struct device *dev, struct rtc_time *tm);
+static int tps6586x_rtc_set_time(struct device *dev, struct rtc_time *tm);
+static ssize_t store_rtc_time(struct device *class,struct device_attribute *attr,const char *buf, size_t count)
+{
+	#define YEAR_OFFSET (0)
+	#define YEAR_SIZE (4)
+	#define MON_OFFSET (YEAR_SIZE+1)
+	#define MON_SIZE (2)
+	#define MDAY_OFFSET (MON_OFFSET + MON_SIZE+1)
+	#define MDAY_SIZE (2)
+       int ret=count;
+	int err=0;
+	struct rtc_time tm;
+	char year[10]={0};
+	char mon[10]={0};
+	char mday[10]={0};
+
+	memcpy(year,buf,YEAR_SIZE);
+	memcpy(mon,buf+MON_OFFSET,MON_SIZE);
+	memcpy(mday,buf+MDAY_OFFSET ,MDAY_SIZE);
+	printk("year=%s mon=%s day=%s\n",year,mon,mday);
+
+	tm.tm_year=simple_strtol(year, NULL, 0);
+	tm.tm_year-=1900;
+	tm.tm_mon=simple_strtol(mon, NULL, 0);
+	tm.tm_mon-=1;
+	tm.tm_mday=simple_strtol(mday, NULL, 0);
+	tm.tm_hour=0;
+	tm.tm_min=0;
+	tm.tm_sec=0;
+	err = rtc_valid_tm(&tm);
+	if (err != 0){
+		printk("store_rtc_time: not vaild time\n");
+		goto fail;
+	}
+	err = mutex_lock_interruptible(&ptps6586x_rtc_dev->rtc->ops_lock);
+	if (err)
+		goto fail;
+	tps6586x_rtc_set_time(ptps6586x_rtc_dev->rtc->dev.parent,&tm);
+	mutex_unlock(&ptps6586x_rtc_dev->rtc->ops_lock);
+fail:
+	return ret;
+}
+static ssize_t show_rtc_time(struct device *dev, struct device_attribute *devattr, char *buf)
+{
+	struct rtc_time tm;
+	int err=0;
+
+	printk("show_rtc_time\n");
+	err = mutex_lock_interruptible(&ptps6586x_rtc_dev->rtc->ops_lock);
+	if (err)
+		goto fail;
+	tps6586x_rtc_read_time(ptps6586x_rtc_dev->rtc->dev.parent, &tm);
+	mutex_unlock(&ptps6586x_rtc_dev->rtc->ops_lock);
+	return sprintf(buf, "%d/%d/%d\n", tm.tm_year+1900,tm.tm_mon+1,tm.tm_mday);
+fail:
+	return 0;
+}
+static DEVICE_ATTR(rtc_time, S_IWUSR | S_IRUGO, show_rtc_time,store_rtc_time);
+
+static struct attribute *tps_rtc_attributes[] = {
+	&dev_attr_rtc_time.attr,
+	NULL
+};
+static const struct attribute_group tps_rtc_group = {
+	.attrs = tps_rtc_attributes,
+};
 static inline struct device *to_tps6586x_dev(struct device *dev)
 {
 	return dev->parent;
@@ -133,8 +202,12 @@ static int tps6586x_rtc_set_alarm(struct device *dev, struct rtc_wkalrm *alrm)
 	struct device *tps_dev = to_tps6586x_dev(dev);
 	unsigned long seconds;
 	unsigned long ticks;
+	unsigned long rtc_current_time;
+	unsigned long long rticks = 0;
 	u8 buff[3];
+	u8 rbuff[6];
 	int err;
+	int i;
 
 	if (rtc->irq == -1)
 		return -EIO;
@@ -155,6 +228,22 @@ static int tps6586x_rtc_set_alarm(struct device *dev, struct rtc_wkalrm *alrm)
 	}
 
 	seconds -= rtc->epoch_start;
+
+	err = tps6586x_reads(tps_dev, RTC_COUNT4_DUMMYREAD, sizeof(rbuff), rbuff);
+	if (err < 0) {
+		dev_err(dev, "failed to read counter\n");
+		return err;
+	}
+
+	for (i = 1; i < sizeof(rbuff); i++) {
+		rticks <<= 8;
+		rticks |= rbuff[i];
+	}
+
+	rtc_current_time = rticks >> 10;
+	if ((seconds - rtc_current_time) > ALM1_VALID_RANGE_IN_SEC)
+		seconds = rtc_current_time - 1;
+
 	ticks = (unsigned long long)seconds << 10;
 
 	buff[0] = (ticks >> 16) & 0xff;
@@ -263,6 +352,11 @@ static int __devinit tps6586x_rtc_probe(struct platform_device *pdev)
 	int err;
 	struct tps6586x_epoch_start *epoch;
 
+	if (!pdata) {
+		dev_err(&pdev->dev, "no platform_data specified\n");
+		return -EINVAL;
+	}
+
 	rtc = kzalloc(sizeof(*rtc), GFP_KERNEL);
 
 	if (!rtc)
@@ -270,17 +364,16 @@ static int __devinit tps6586x_rtc_probe(struct platform_device *pdev)
 
 	rtc->irq = -1;
 
-	if (!pdata) {
-		dev_err(&pdev->dev, "no platform_data specified\n");
-		return -EINVAL;
-	}
-
 	if (pdata->irq < 0)
 		dev_warn(&pdev->dev, "no IRQ specified, wakeup is disabled\n");
 
 	epoch = &pdata->start;
 	rtc->epoch_start = mktime(epoch->year, epoch->month, epoch->day,
 				  epoch->hour, epoch->min, epoch->sec);
+
+	dev_set_drvdata(&pdev->dev, rtc);
+
+	device_init_wakeup(&pdev->dev, 1);
 
 	rtc->rtc = rtc_device_register("tps6586x-rtc", &pdev->dev,
 				       &tps6586x_rtc_ops, THIS_MODULE);
@@ -300,7 +393,6 @@ static int __devinit tps6586x_rtc_probe(struct platform_device *pdev)
 		goto fail;
 	}
 
-	dev_set_drvdata(&pdev->dev, rtc);
 	if (pdata && (pdata->irq >= 0)) {
 		rtc->irq = pdata->irq;
 		err = request_threaded_irq(pdata->irq, NULL, tps6586x_rtc_irq,
@@ -310,17 +402,20 @@ static int __devinit tps6586x_rtc_probe(struct platform_device *pdev)
 			dev_warn(&pdev->dev, "unable to request IRQ(%d)\n", rtc->irq);
 			rtc->irq = -1;
 		} else {
-			device_init_wakeup(&pdev->dev, 1);
 			enable_irq_wake(rtc->irq);
 			disable_irq(rtc->irq);
 		}
 	}
-
+	ptps6586x_rtc_dev=rtc;
+	if (sysfs_create_group(&pdev->dev.kobj, &tps_rtc_group )) {
+		printk(" tps6586x_rtc_probe : Not able to create the sysfs\n");
+	}
 	return 0;
 
 fail:
 	if (!IS_ERR_OR_NULL(rtc->rtc))
 		rtc_device_unregister(rtc->rtc);
+	device_init_wakeup(&pdev->dev, 0);
 	kfree(rtc);
 	return err;
 }
@@ -360,4 +455,4 @@ module_exit(tps6586x_rtc_exit);
 MODULE_DESCRIPTION("TI TPS6586x RTC driver");
 MODULE_AUTHOR("NVIDIA Corporation");
 MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:rtc-tps6586x")
+MODULE_ALIAS("platform:rtc-tps6586x");

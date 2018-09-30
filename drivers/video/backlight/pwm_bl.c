@@ -24,17 +24,8 @@
 #include <linux/delay.h>
 #include <mach/dc.h>
 #include <linux/gpio.h>
-
-/* LVDS_SHTDN_N, GPIO_PB2*/
-#define ventana_lvds_shutdown	10
-/* EN_VDD_PNL, GPIO_PC6 */
-#define ventana_pnl_pwr_enb	22
 /* LCD_BL_EN, GPIO_PD4 */
 #define ventana_bl_enb		28
-
-static struct pwm_bl_data *pwm_bl_for_charge;
-static bool b_lcd_is_on = true;
-static struct timeval t_pnl_pwr_off;
 
 struct pwm_bl_data {
 	struct pwm_device	*pwm;
@@ -66,75 +57,6 @@ static unsigned int asus_remapped_brightness[] = {
 	21675, 21930, 22185, 22440, 22695, 22950, 23205, 23460, 23715, 23970, 24225, 24480, 24735, 24990, 25245, 25500,
 };
 
-void PowerOnSeqForChargingMode()
-{
-	if (!b_lcd_is_on) {
-		struct timeval t_pnl_pwr_on;
-		int diff_msec = 0;
-
-		b_lcd_is_on = true;
-
-		printk("LCD Power ON for ChargingMode\n");
-
-		/* HSD: TP13= 1000 ms */
-		do_gettimeofday(&t_pnl_pwr_on);
-		diff_msec = ((t_pnl_pwr_on.tv_sec - t_pnl_pwr_off.tv_sec) * 1000000 +
-			(t_pnl_pwr_on.tv_usec - t_pnl_pwr_off.tv_usec)) / 1000;
-		if((diff_msec < 1000) && (diff_msec >= 0))
-			msleep(1000 - diff_msec);
-
-		gpio_set_value(ventana_pnl_pwr_enb, 1);
-
-		/* HSD: TP2= 0 ~50 ms */
-		msleep(10);
-
-		gpio_set_value(ventana_lvds_shutdown, 1);
-
-		/* HSD: TP3 + TP5 = 210 ms ~ */
-		msleep(210);
-
-		pwm_config(pwm_bl_for_charge->pwm,
-			128 * pwm_bl_for_charge->period / 255,
-			pwm_bl_for_charge->period);
-		pwm_enable(pwm_bl_for_charge->pwm);
-
-		/* HSD: TP6= 10ms~ */
-		msleep(10);
-
-		gpio_set_value(ventana_bl_enb, 1);
-
-	} else
-		printk("LCD has been already ON. So, do nothing.\n");
-}
-EXPORT_SYMBOL(PowerOnSeqForChargingMode);
-
-void PowerOffSeqForChargingMode()
-{
-	gpio_set_value(ventana_bl_enb, 0);
-
-	/* HSD: TP7= 0 ms~ */
-	msleep(5);
-
-	pwm_config(pwm_bl_for_charge->pwm, 0, pwm_bl_for_charge->period);
-	pwm_disable(pwm_bl_for_charge->pwm);
-
-	/* HSD: TP8 + TP10= 210 ms~ */
-	msleep(210);
-
-	gpio_set_value(ventana_lvds_shutdown, 0);
-
-	/* HSD: TP11= 0 ~50 ms */
-	msleep(10);
-
-	gpio_set_value(ventana_pnl_pwr_enb, 0);
-
-	do_gettimeofday(&t_pnl_pwr_off);
-
-	b_lcd_is_on =false;
-	printk("LCD Power OFF for ChargingMode\n");
-}
-EXPORT_SYMBOL(PowerOffSeqForChargingMode);
-
 static int pwm_backlight_update_status(struct backlight_device *bl)
 {
 	struct pwm_bl_data *pb = dev_get_drvdata(&bl->dev);
@@ -145,7 +67,6 @@ static int pwm_backlight_update_status(struct backlight_device *bl)
 		printk("Can't update brightness 'cause of \"bl->props.power != FB_BLANK_UNBLANK\"\n");
 		brightness = 0;
 	}
-
 	if (bl->props.fb_blank != FB_BLANK_UNBLANK) {
 		printk("Can't update brightness 'cause of \"bl->props.fb_blank != FB_BLANK_UNBLANK\"\n");
 		brightness = 0;
@@ -170,8 +91,10 @@ static int pwm_backlight_update_status(struct backlight_device *bl)
 			pwm_config(pb->pwm, asus_remapped_brightness[brightness] * (pb->period / 100) / max, pb->period);
 			pwm_enable(pb->pwm);
 
-			/* HSD: TP6= 10ms~ */
-			msleep(10);
+			if (gpio_get_value(ventana_bl_enb) == 0) {
+				/* HSD: TP6= 10ms~ */
+				msleep(10);
+			}
 
 			if (pb->notify) {
 				/* ventana_backlight_notify(); */
@@ -243,6 +166,7 @@ static int pwm_backlight_probe(struct platform_device *pdev)
 		dev_dbg(&pdev->dev, "got pwm for backlight\n");
 
 	memset(&props, 0, sizeof(struct backlight_properties));
+	props.type = BACKLIGHT_RAW;
 	props.max_brightness = data->max_brightness;
 	bl = backlight_device_register(dev_name(&pdev->dev), &pdev->dev, pb,
 				       &pwm_backlight_ops, &props);
@@ -256,8 +180,6 @@ static int pwm_backlight_probe(struct platform_device *pdev)
 	backlight_update_status(bl);
 
 	platform_set_drvdata(pdev, bl);
-
-	pwm_bl_for_charge = pb;
 	return 0;
 
 err_bl:

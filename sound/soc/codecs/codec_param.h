@@ -5,8 +5,8 @@
 */
 
 enum project_id {
-	EP101 = 0,
-	EP102,
+	TF101 = 0,      //TF101(EP101)
+	SL101,           //SL101(EP102)
 };
 
 struct wm8903_parameters{

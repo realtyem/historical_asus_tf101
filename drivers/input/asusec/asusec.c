@@ -189,9 +189,6 @@ static int asusec_kp_sci_table[]={0, KEY_SLEEP, KEY_WLAN, KEY_BLUETOOTH,
 		KEY_WWW, ASUSEC_KEY_SETTING, KEY_PREVIOUSSONG, KEY_PLAYPAUSE, 
 		KEY_NEXTSONG, KEY_MUTE, KEY_VOLUMEDOWN, KEY_VOLUMEUP};
 
-/*
- * functions definition
- */
 static void asusec_dockram_init(struct i2c_client *client){
 	dockram_client.adapter = client->adapter;
 	dockram_client.addr = 0x1b;
@@ -257,6 +254,7 @@ static int asusec_i2c_read_data(struct i2c_client *client)
 	}
 
 	ret = i2c_smbus_read_i2c_block_data(client, 0x6A, 8, ec_chip->i2c_data);
+	ASUSEC_I2C_DATA(ec_chip->i2c_data, ec_chip->index);
 	if (ret < 0) {
 		ASUSEC_ERR("Fail to read data, status %d\n", ret);
 	}
@@ -765,6 +763,7 @@ static int asusec_irq(struct i2c_client *client)
 		rc = -EIO;
 		goto err_gpio_request_irq_fail ;
 	}	
+	enable_irq_wake(client->irq);
 	ASUSEC_INFO("request irq = %d, rc = %d\n", client->irq, rc);	
 
 	return 0 ;
@@ -1300,8 +1299,9 @@ static void asusec_stresstest_work_function(struct work_struct *dat)
 
 	queue_delayed_work(asusec_wq, &asusec_stress_work, HZ/ec_chip->polling_rate);
 }
-
+#if CALLBACK_READY
 extern void docking_callback(void );
+#endif
 static void asusec_dock_init_work_function(struct work_struct *dat)
 {
 	int gpio = TEGRA_GPIO_PX5;
@@ -1328,7 +1328,9 @@ static void asusec_dock_init_work_function(struct work_struct *dat)
 					break;
 				}
 			}
+#if CALLBACK_READY
 			docking_callback();
+#endif
 			ec_chip->dock_det--;
 			ec_chip->re_init = 0;
 		}
@@ -1405,7 +1407,11 @@ static void asusec_work_function(struct work_struct *dat)
 	if (ec_chip->wakeup_lcd){
 		if (gpio_get_value(TEGRA_GPIO_PS4)){
 			ec_chip->wakeup_lcd = 0;
-			ec_chip->dock_in = gpio_get_value(TEGRA_GPIO_PX5) ? 0 : 1;
+			if (ASUSGetProjectID()==101){
+				ec_chip->dock_in = gpio_get_value(TEGRA_GPIO_PX5) ? 0 : 1;
+			} else if (ASUSGetProjectID()==102){
+				ec_chip->dock_in = 1;
+			}
 			wake_lock_timeout(&ec_chip->wake_lock, 3*HZ);
 			msleep(500);
 		}
@@ -1827,8 +1833,14 @@ static int asusec_resume(struct i2c_client *client){
 	printk("asusec_resume+\n");
 
 	ec_chip->suspend_state = 0;
-	asusec_dock_info_update();
-	asusec_dock_status_check();
+	if (ASUSGetProjectID()==101){
+		asusec_dock_info_update();
+		asusec_dock_status_check();
+	} else if (ASUSGetProjectID()==102){
+		ec_chip->init_success = 0;
+		wake_lock(&ec_chip->wake_lock_init);
+		queue_delayed_work(asusec_wq, &ec_chip->asusec_dock_init_work, 0);
+	}
 
 	printk("asusec_resume-\n");
 	return 0;	
@@ -1860,7 +1872,7 @@ static ssize_t asusec_switch_name(struct switch_dev *sdev, char *buf)
 static ssize_t asusec_switch_state(struct switch_dev *sdev, char *buf)
 {
 	if (ASUSGetProjectID() == 101) {
-		return sprintf(buf, "%s\n", (ec_chip->dock_in ? "10" : "0"));
+		return sprintf(buf, "%s\n", (ec_chip->dock_in && ec_chip->init_success ? "10" : "0"));
 	} else {
 		return sprintf(buf, "%s\n", "0");
 	}
@@ -1972,6 +1984,13 @@ static long asusec_ioctl(struct file *flip,
 				ASUSEC_ERR("Unknown argument");
 				return -ENOTTY;
 			}
+		case ASUSEC_FW_DUMMY:
+			ASUSEC_NOTICE("ASUSEC_FW_DUMMY\n");
+			ec_chip->i2c_dm_data[0] = 0x02;
+			ec_chip->i2c_dm_data[1] = 0x55;
+			ec_chip->i2c_dm_data[2] = 0xAA;
+			asusec_dockram_write_data(0x40,3);
+			return 0;
         default: /* redundant, as cmd was checked against MAXNR */
             return -ENOTTY;
 	}
@@ -2082,7 +2101,7 @@ static ssize_t ec_write(struct file *file, const char __user *buf, size_t count,
         ASUSEC_ERR("ec_write copy error\n");
         return err;
     }
-   
+
     h2ec_count = count;
     //ASUSEC_INFO("ec_write (%d)\n",count);
     for (i = 0; i < count ; i++) 

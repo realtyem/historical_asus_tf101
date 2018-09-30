@@ -40,6 +40,11 @@
 #include <linux/gpio.h>
 #include <../arch/arm/mach-tegra/gpio-names.h>
 #include "atmel_firmware_ep102.h"
+#include <linux/poll.h>
+#include <linux/kfifo.h>
+#include <linux/version.h>
+#include <linux/earlysuspend.h>
+#include <linux/switch.h>
 
 /*
  * This is a driver for the Atmel maXTouch Object Protocol
@@ -259,6 +264,10 @@ struct mxt_data_ep102 {
 	struct mutex msg_mutex;
 	struct attribute_group attrs;
 	int status;
+	struct semaphore sem;
+	bool interruptable;
+	struct early_suspend early_suspend;
+    struct switch_dev touch_sdev;
 };
 
 #define I2C_RETRY_COUNT 5
@@ -1611,13 +1620,16 @@ void process_T9_message_ep102(u8 *message, struct mxt_data_ep102 *mxt, int last_
 	 * active.
 	 */
 	if (last_touch) {
+                input_report_key(mxt->input, BTN_TOUCH, 1); 
 		for (i = 0; i < 10; i++) {
-			if (stored_size[i]) {
+			if (fingerInfo[i].pressure) {
 				active_touches++;
 				input_report_abs(mxt->input, ABS_MT_TRACKING_ID,
 						 i);
 				input_report_abs(mxt->input, ABS_MT_TOUCH_MAJOR,
 						 fingerInfo[i].pressure);
+                                input_report_abs(mxt->input, ABS_MT_PRESSURE,
+                                                 fingerInfo[i].pressure);
 				input_report_abs(mxt->input, ABS_MT_POSITION_X,
 						 fingerInfo[i].x);
 				input_report_abs(mxt->input, ABS_MT_POSITION_Y,
@@ -1982,6 +1994,12 @@ int process_message_ep102(u8 *message, u8 object, struct mxt_data_ep102 *mxt)
 
 	return 0;
 }
+static void setInterruptable(struct i2c_client *client, bool interrupt){
+    struct mxt_data_ep102*mxt = i2c_get_clientdata(client);
+    down(&mxt->sem);
+    mxt->interruptable = interrupt;
+    up(&mxt->sem);
+}
 
 /*
  * Processes messages when the interrupt line (CHG) is asserted. Keeps
@@ -2018,6 +2036,7 @@ static void mxt_worker_ep102(struct work_struct *work)
 		message = kmalloc(message_length, GFP_KERNEL);
 		if (message == NULL) {
 			dev_err(&client->dev, "Error allocating memory\n");
+		   setInterruptable(client, false);
 			return;
 		}
 	} else {
@@ -2044,6 +2063,7 @@ static void mxt_worker_ep102(struct work_struct *work)
 		}
 		if (error < 0) {
 			kfree(message);
+		setInterruptable(client, false);
 			return;
 		}
 
@@ -2062,6 +2082,7 @@ static void mxt_worker_ep102(struct work_struct *work)
 				dev_err(&client->dev,
 					"Error allocating memory\n");
 				kfree(message);
+		setInterruptable(client, false);
 				return;
 			}
 			message_start = message_string;
@@ -2110,7 +2131,7 @@ static irqreturn_t mxt_irq_handler_ep102(int irq, void *_mxt)
 	mxt->irq_counter++;
 	if (mxt->valid_interrupt()) {
 		/* Send the signal only if falling edge generated the irq. */
-		cancel_delayed_work(&mxt->dwork);
+		//cancel_delayed_work(&mxt->dwork);
 		schedule_delayed_work(&mxt->dwork, 0);
 		mxt->valid_irq_counter++;
 	} else {
@@ -2119,6 +2140,65 @@ static irqreturn_t mxt_irq_handler_ep102(int irq, void *_mxt)
 	}
 
 	return IRQ_HANDLED;
+}
+static int recovery_from_bootMode(struct i2c_client *client){
+    u8 buf[MXT_ID_BLOCK_SIZE];
+    int ret;
+    int identified;
+    int retry = 40;
+    int times;
+    unsigned char data[] = {0x01, 0x01};
+    struct i2c_msg wmsg;
+    
+    wmsg.addr = 0x34;
+    wmsg.flags = I2C_M_WR;
+    wmsg.len = 2;
+    wmsg.buf = data;
+    dev_err(&client->dev, "---------Touch: Try to leave the bootloader mode!\n");
+	/*Write two nosense bytes to I2C address "0x35" in order to force touch to leave the bootloader mode.*/
+    i2c_transfer(client->adapter, &wmsg, 1);
+    mdelay(10);
+	
+    /* Read Device info to check if chip is valid */
+    for(times = 0; times < retry; times++ ){
+        ret = mxt_read_block_ep102(client, MXT_ADDR_INFO_BLOCK, MXT_ID_BLOCK_SIZE, (u8 *) buf); 
+	  if(ret >= 0)
+	      break;
+
+	  dev_err(&client->dev, "Retry addressing I2C address 0x%02X with %d times\n", client->addr,times+1); 	 
+	  msleep(25);
+    }	
+	
+    if(ret >= 0){
+        dev_err(&client->dev, "---------Touch: Successfully leave the bootloader mode!\n");
+		ret = 0;
+    }    
+    return ret;
+}
+
+static bool isInBootLoaderMode(struct i2c_client *client){
+    u8 buf[2];
+	int ret;
+	int identified;
+	int retry = 2;
+	int times;
+	struct i2c_msg rmsg;
+
+	rmsg.addr=0x34;
+	rmsg.flags = I2C_M_RD;
+	rmsg.len = 2;
+	rmsg.buf = buf;
+	
+    /* Read 2 byte from boot loader I2C address to make sure touch chip is in bootloader mode */   
+	for(times = 0; times < retry; times++ ){
+	     ret = i2c_transfer(client->adapter, &rmsg, 1); 
+	     if(ret >= 0)
+		 	break;
+		 	  	 
+	     msleep(25);
+	}
+	dev_err(&client->dev, "The touch is %s in bootloader mode.\n", (ret < 0 ? "not" : "indeed"));
+	return ret >= 0;
 }
 
 /******************************************************************************/
@@ -2135,6 +2215,8 @@ static int __devinit mxt_identify_ep102(struct i2c_client *client,
 	int times;
       
 	identified = 0;
+        if(isInBootLoaderMode(client)) 
+             recovery_from_bootMode(client);
 
 	/* Read Device info to check if chip is valid */
        for(times = 0; times < retry; times++ ){
@@ -2536,6 +2618,40 @@ int mxt_stress_ioctl_ep102(struct file *filp, unsigned int cmd, unsigned long ar
 		.open =		mxt_stress_open_ep102,
 		.release =	mxt_stress_release_ep102,
 		};
+
+#ifdef CONFIG_HAS_EARLYSUSPEND
+static void mxt_early_suspend_ep102(struct early_suspend *es)
+{
+	struct mxt_data_ep102*mxt;
+	mxt = container_of(es, struct mxt_data_ep102, early_suspend);
+
+	if (mxt_suspend_ep102(mxt->client, PMSG_SUSPEND) != 0)
+		dev_err(&mxt->client->dev, "%s: failed\n", __func__);
+	printk(KERN_WARNING "MXT Early Suspended\n");
+}
+
+static void mxt_early_resume_ep102(struct early_suspend *es)
+{
+	struct mxt_data_ep102 *mxt;
+	mxt = container_of(es, struct mxt_data_ep102, early_suspend);
+
+	if (mxt_resume_ep102(mxt->client) != 0)
+		dev_err(&mxt->client->dev, "%s: failed\n", __func__);
+	printk(KERN_WARNING "MXT Early Resumed\n");
+}
+#endif
+
+static ssize_t mxt_touch_switch_name(struct switch_dev *sdev, char *buf)
+{
+      struct mxt_data_ep102 *mxt = globe_mxt_ep102;
+	return sprintf(buf, "MXT-%d.%d build-%u\n", 
+		        mxt->device_info.major, mxt->device_info.minor, mxt->device_info.build);
+}
+
+static ssize_t mxt_touch_switch_state(struct switch_dev *sdev, char *buf)
+{ 
+      	return sprintf(buf, "%s\n", "0");
+}
 static int __devinit mxt_probe_ep102(struct i2c_client *client,
 			       const struct i2c_device_id *id)
 {
@@ -2708,6 +2824,8 @@ static int __devinit mxt_probe_ep102(struct i2c_client *client,
 	input_set_abs_params(input, ABS_MT_POSITION_Y, 0, mxt->max_y_val, 0, 0);
 	input_set_abs_params(input, ABS_MT_TOUCH_MAJOR, 0, MXT_MAX_TOUCH_SIZE,
 			     0, 0);
+        input_set_abs_params(input, ABS_MT_PRESSURE, 0, MXT_MAX_REPORTED_PRESSURE,
+                             0, 0);
 	input_set_abs_params(input, ABS_MT_TRACKING_ID, 0, MXT_MAX_NUM_TOUCHES,
 			     0, 0);
 
@@ -2717,6 +2835,8 @@ static int __devinit mxt_probe_ep102(struct i2c_client *client,
 
 
 	mxt_debug_ep102(DEBUG_TRACE, "maXTouch driver setting client data\n");
+	sema_init(&mxt->sem, 1); 
+	mxt->interruptable = true;
 	i2c_set_clientdata(client, mxt);
 
 mxt->status = 0;
@@ -2812,7 +2932,12 @@ init_key_array (mxt);
 			goto err_irq;
 		}
 	}
-
+#ifdef CONFIG_HAS_EARLYSUSPEND
+	mxt->early_suspend.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN + 21;
+	mxt->early_suspend.suspend = mxt_early_suspend_ep102;
+	mxt->early_suspend.resume = mxt_early_resume_ep102;
+	register_early_suspend(&mxt->early_suspend);
+#endif
 	sensor_work_queue_ep102= create_singlethread_workqueue("i2c_touchsensor_wq");
 	if(!sensor_work_queue_ep102){
 		pr_err("touch_probe: Unable to create workqueue");
@@ -2828,6 +2953,14 @@ init_key_array (mxt);
 			pr_err("tegra_acc_probe: Unable to register %s \\misc device\n", mxt->misc_dev.name);
 		goto misc_register_device_failed;
 			}
+    mxt->touch_sdev.name = "touch";
+    mxt->touch_sdev.print_name = mxt_touch_switch_name;
+	mxt->touch_sdev.print_state = mxt_touch_switch_state;
+	if(switch_dev_register(&mxt->touch_sdev) < 0){
+		dev_info(&client->dev, "switch_dev_register for dock failed!\n");
+		//goto exit;
+	}
+	switch_set_state(&mxt->touch_sdev, 0);
 	if (debug_ep102 > DEBUG_INFO)
 		dev_info(&client->dev, "touchscreen, irq %d\n", mxt->irq);
 
@@ -2914,7 +3047,7 @@ static int __devexit mxt_remove_ep102(struct i2c_client *client)
 static void mxt_start(struct mxt_data_ep102*mxt)
 {
 	mxt_write_byte_ep102(mxt->client,
-		MXT_BASE_ADDR(MXT_TOUCH_MULTITOUCHSCREEN_T9, mxt), suspend_config_T9_ep102);
+		MXT_BASE_ADDR(MXT_TOUCH_MULTITOUCHSCREEN_T9, mxt), 0x8F);
 }
 
 static void mxt_stop(struct mxt_data_ep102*mxt)
@@ -2924,31 +3057,11 @@ static void mxt_stop(struct mxt_data_ep102*mxt)
 }
  int mxt_disable_ep102(void)
 {
-	pm_message_t msg;
-	msg.event= -1;
-
-       if(!mxt_client_ep102){
-	      printk("mxt_disable fail!mxt_client_ep102 is NULL\n");
-	      return  -ENODEV;
-       }
-
-	  printk("mxt_disable +\n");
-	  mxt_suspend_ep102(mxt_client_ep102, msg);
-	  printk("mxt_disable -\n");
-
-	return mxt_disable_result_ep102;
+	return 0;
 }
 EXPORT_SYMBOL(mxt_disable_ep102);
  int mxt_enable_ep102(void)
 {
-       if(!mxt_client_ep102){
-	      printk("mxt_enable fail!mxt_client_ep102 is NULL\n");
-	      return  -ENODEV;
-       }
-
-	   printk("mxt_enable+\n");
-	   mxt_resume_ep102(mxt_client_ep102);
-	   printk("mxt_enable-\n");
 	return 0;
 }
  EXPORT_SYMBOL(mxt_enable_ep102);
@@ -2983,6 +3096,8 @@ static int mxt_resume_ep102(struct i2c_client *client)
 	printk("ep102 Atmel touch resume\n");
 	struct mxt_data_ep102 *mxt = i2c_get_clientdata(client);
 	int chg_retry=0;
+        int error;
+        u8 buf[1];
 	if (!suspend_flag_ep102)
 		return 0;
 	printk("Touch ep102: force reset by PQ7 \n");
@@ -2999,11 +3114,14 @@ static int mxt_resume_ep102(struct i2c_client *client)
 
 	if(chg_retry >= 10)
 		printk("Touch: change pin kept low!\n");
-
+      
 	force_release_pos_ep102();
 
 	mxt_write_byte_ep102(mxt->client, MXT_BASE_ADDR(MXT_USER_INFO_T38, mxt), 0);
 	msleep(25);
+	error = mxt_read_block_ep102(client, MXT_BASE_ADDR(MXT_USER_INFO_T38, mxt), 1, buf);
+	if(error < 0 && isInBootLoaderMode(client)) // start boot loader recovery mode
+            recovery_from_bootMode(client);
 	mxt_write_byte_ep102(mxt->client, MXT_BASE_ADDR(MXT_GEN_POWERCONFIG_T7, mxt), 0x1E);
 	mxt_write_byte_ep102(mxt->client, MXT_BASE_ADDR(MXT_GEN_POWERCONFIG_T7, mxt) + 1, 0xFF);
 	mxt_write_byte_ep102(mxt->client, MXT_BASE_ADDR(MXT_GEN_ACQUIRECONFIG_T8, mxt)+ 6, 0x05);
@@ -3022,6 +3140,10 @@ static int mxt_resume_ep102(struct i2c_client *client)
 	resume_flag_ep102 = true;
 	delta_flag = true;
 	enable_irq(mxt->irq);
+	if(!mxt->interruptable){
+	    enable_irq(mxt->irq);
+	    setInterruptable(client, true);
+	}
 	return 0;
 }
 #else

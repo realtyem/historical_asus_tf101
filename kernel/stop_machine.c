@@ -58,6 +58,8 @@ static void cpu_stop_signal_done(struct cpu_stop_done *done, bool executed)
 			done->executed = true;
 		if (atomic_dec_and_test(&done->nr_todo))
 			complete(&done->completion);
+		if(suspend_enter_flag)
+			printk("cpu_stop_signal_done executed=%x nr_todo=%d\n",executed ,atomic_read(&done->nr_todo));
 	}
 }
 
@@ -66,6 +68,7 @@ static void cpu_stop_queue_work(struct cpu_stopper *stopper,
 				struct cpu_stop_work *work)
 {
 	unsigned long flags;
+
 	spin_lock_irqsave(&stopper->lock, flags);
 
 	if (stopper->enabled) {
@@ -171,7 +174,8 @@ static DEFINE_PER_CPU(struct cpu_stop_work, stop_cpus_work);
 #define MAXIMAL_CPU_ID   (8)
 volatile unsigned int cpux_wake_up[MAXIMAL_CPU_ID]={0};
 volatile unsigned int cpux_wake_up_fail[MAXIMAL_CPU_ID]={0};
-#define STOP_CPU_TIMEOUT  (HZ * 2);
+#define STOP_CPU_TIMEOUT  (HZ * 4)
+#define STOP_MECHANISM_TIMEOUT  (HZ * 3)
 static void stop_cpu_timeout(unsigned long data)
 {
 	unsigned int cpu;
@@ -252,12 +256,22 @@ int __stop_cpus(const struct cpumask *cpumask, cpu_stop_fn_t fn, void *arg)
 				    &per_cpu(stop_cpus_work, cpu));
 	}
 	preempt_enable();
+
+	if(suspend_enter_flag){
+		printk("__stop_cpus: wait_for_completion_timeout+\n");
+		if(0== wait_for_completion_timeout(&done.completion,STOP_CPU_TIMEOUT+(HZ/2) ) ){
+			printk("[warnning timeout] __stop_cpus: wait_for_completion_timeout \n" );
+			stop_cpu_timeout((unsigned long)cpumask);
+		}
+
+	}
+	else
 	wait_for_completion(&done.completion);
 
 	if(suspend_enter_flag){
+		printk("__stop_cpus: smp=%u done.executed=%u done.ret =%u-\n",smp_processor_id(),done.executed , done.ret );
 		del_timer_sync(&timer);
 		destroy_timer_on_stack(&timer);
-		printk("__stop_cpus: smp=%u done.executed=%u done.ret =%u-\n",smp_processor_id(),done.executed , done.ret );
 	}
 	return done.executed ? done.ret : -ENOENT;
 }
@@ -322,6 +336,7 @@ int stop_cpus(const struct cpumask *cpumask, cpu_stop_fn_t fn, void *arg)
 int try_stop_cpus(const struct cpumask *cpumask, cpu_stop_fn_t fn, void *arg)
 {
 	int ret;
+
 	/* static works are used, process one request at a time */
 	if (!mutex_trylock(&stop_cpus_mutex))
 		return -EAGAIN;
@@ -335,6 +350,7 @@ static int cpu_stopper_thread(void *data)
 	struct cpu_stopper *stopper = data;
 	struct cpu_stop_work *work;
 	int ret;
+
 repeat:
 	set_current_state(TASK_INTERRUPTIBLE);	/* mb paired w/ kthread_stop */
 
@@ -356,9 +372,10 @@ repeat:
 		cpu_stop_fn_t fn = work->fn;
 		void *arg = work->arg;
 		struct cpu_stop_done *done = work->done;
-		char ksym_buf[KSYM_NAME_LEN];
+		char ksym_buf[KSYM_NAME_LEN] __maybe_unused;
 
 		__set_current_state(TASK_RUNNING);
+
 		/* cpu stop callbacks are not allowed to sleep */
 		preempt_disable();
 
@@ -377,33 +394,36 @@ repeat:
 	} else
 		schedule();
 
-
 	goto repeat;
 }
+
+extern void sched_set_stop_task(int cpu, struct task_struct *stop);
 
 /* manage stopper for a cpu, mostly lifted from sched migration thread mgmt */
 static int __cpuinit cpu_stop_cpu_callback(struct notifier_block *nfb,
 					   unsigned long action, void *hcpu)
 {
-	struct sched_param param = { .sched_priority = MAX_RT_PRIO - 1 };
 	unsigned int cpu = (unsigned long)hcpu;
 	struct cpu_stopper *stopper = &per_cpu(cpu_stopper, cpu);
 	struct task_struct *p;
+
 	switch (action & ~CPU_TASKS_FROZEN) {
 	case CPU_UP_PREPARE:
 		BUG_ON(stopper->thread || stopper->enabled ||
 		       !list_empty(&stopper->works));
-		p = kthread_create(cpu_stopper_thread, stopper, "migration/%d",
-				   cpu);
+		p = kthread_create_on_node(cpu_stopper_thread,
+					   stopper,
+					   cpu_to_node(cpu),
+					   "migration/%d", cpu);
 		if (IS_ERR(p))
-			return NOTIFY_BAD;
-		sched_setscheduler_nocheck(p, SCHED_FIFO, &param);
+			return notifier_from_errno(PTR_ERR(p));
 		get_task_struct(p);
+		kthread_bind(p, cpu);
+		sched_set_stop_task(cpu, p);
 		stopper->thread = p;
 		break;
 
 	case CPU_ONLINE:
-		kthread_bind(stopper->thread, cpu);
 		/* strictly unnecessary, as first user will wake it */
 		wake_up_process(stopper->thread);
 		/* mark enabled */
@@ -417,6 +437,8 @@ static int __cpuinit cpu_stop_cpu_callback(struct notifier_block *nfb,
 	case CPU_POST_DEAD:
 	{
 		struct cpu_stop_work *work;
+
+		sched_set_stop_task(cpu, NULL);
 		/* kill the stopper */
 		kthread_stop(stopper->thread);
 		/* drain remaining works */
@@ -451,6 +473,7 @@ static int __init cpu_stop_init(void)
 	void *bcpu = (void *)(long)smp_processor_id();
 	unsigned int cpu;
 	int err;
+
 	for_each_possible_cpu(cpu) {
 		struct cpu_stopper *stopper = &per_cpu(cpu_stopper, cpu);
 
@@ -461,7 +484,7 @@ static int __init cpu_stop_init(void)
 	/* start one for the boot cpu */
 	err = cpu_stop_cpu_callback(&cpu_stop_cpu_notifier, CPU_UP_PREPARE,
 				    bcpu);
-	BUG_ON(err == NOTIFY_BAD);
+	BUG_ON(err != NOTIFY_OK);
 	cpu_stop_cpu_callback(&cpu_stop_cpu_notifier, CPU_ONLINE, bcpu);
 	register_cpu_notifier(&cpu_stop_cpu_notifier);
 
@@ -531,8 +554,10 @@ static int stop_machine_cpu_stop(void *data)
 	bool is_active;
 	unsigned long end_time;
 
-	if ( suspend_enter_flag)
-		end_time=jiffies+2*STOP_CPU_TIMEOUT ;
+	if ( suspend_enter_flag){
+		printk("stop_machine_cpu_stop cpu=%u\n",cpu);
+		end_time=jiffies+STOP_MECHANISM_TIMEOUT ;
+	}
 
 	if (!smdata->active_cpus)
 		is_active = cpu == cpumask_first(cpu_online_mask);
@@ -554,6 +579,10 @@ static int stop_machine_cpu_stop(void *data)
 			case STOPMACHINE_RUN:
 				if (is_active)
 					err = smdata->fn(smdata->data);
+				if (err!=0){
+					local_irq_enable();
+					printk("[Warning]stop_machine_cpu_stop: stop CPU%u fail!\n", cpu);
+				}
 				break;
 			default:
 				break;
@@ -566,7 +595,9 @@ static int stop_machine_cpu_stop(void *data)
 			stop_cpu_timeout((unsigned long) smdata->active_cpus);
 		}
 	} while (curstate < STOPMACHINE_EXIT && !check_cpu_wake());
-       printk("stop_machine_cpu_stop cpu=%u curstate=%u check_cpu_wake()=%d\n",cpu,(unsigned int)curstate,check_cpu_wake());
+
+	if(suspend_enter_flag)
+		printk("stop_machine_cpu_stop cpu=%u curstate=%u check_cpu_wake()=%d\n",cpu,(unsigned int)curstate,check_cpu_wake());
 
 	if(curstate < STOPMACHINE_EXIT)
 		err=1;

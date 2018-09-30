@@ -48,7 +48,7 @@
 #include <linux/completion.h>
 #include <linux/mutex.h>
 #include <scsi/scsi_host.h>
-
+#include <linux/wakelock.h>
 struct us_data;
 struct scsi_cmnd;
 
@@ -73,6 +73,8 @@ struct us_unusual_dev {
 #define US_FLIDX_RESETTING	4	/* device reset in progress */
 #define US_FLIDX_TIMED_OUT	5	/* SCSI midlayer timed out  */
 #define US_FLIDX_DONT_SCAN	6	/* don't scan (disconnect)  */
+#define US_FLIDX_REDO_READ10	7	/* redo READ(10) command    */
+#define US_FLIDX_READ10_WORKED	8	/* previous READ(10) succeeded */
 
 #define USB_STOR_STRING_LEN 32
 
@@ -158,6 +160,7 @@ struct us_data {
 	/* hacks for READ CAPACITY bug handling */
 	int			use_last_sector_hacks;
 	int			last_sector_retries;
+	struct wake_lock scsi_scan_wake_lock;
 };
 
 /* Convert between us_data and the corresponding Scsi_Host */
